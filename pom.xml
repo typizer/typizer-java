@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Typizer Java SDK (ru.typizer:typizer-java). Bytecode Java 8, no runtime dependencies.
+
+  Build and test without a local JDK: scripts/test.sh (Maven in Docker on JDK 8, 17 and 21).
+  Release to Maven Central (from the public mirror github.com/typizer/typizer-java, see
+  .github/workflows/release.yml): mvn -P release deploy.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>ru.typizer</groupId>
+  <artifactId>typizer-java</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>Typizer Java SDK</name>
+  <description>Официальный Java SDK для Typizer API — извлечение данных из документов в JSON по вашей схеме</description>
+  <url>https://typizer.ru</url>
+
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <name>Typizer</name>
+      <email>support@typizer.ru</email>
+      <organization>Typizer</organization>
+      <organizationUrl>https://typizer.ru</organizationUrl>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/typizer/typizer-java.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/typizer/typizer-java.git</developerConnection>
+    <url>https://github.com/typizer/typizer-java</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/typizer/typizer-java/issues</url>
+  </issueManagement>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <maven.compiler.source>1.8</maven.compiler.source>
+    <maven.compiler.target>1.8</maven.compiler.target>
+    <junit.version>5.10.3</junit.version>
+    <!-- Reproducible builds: a fixed timestamp in the jar entries. -->
+    <project.build.outputTimestamp>2026-11-13T00:00:00Z</project.build.outputTimestamp>
+  </properties>
+
+  <!-- No runtime dependencies: JSON, HTTP (HttpURLConnection), multipart and webhook signatures are
+       built in. Jackson and Gson are only used by Run.outputAs() when the application has one. -->
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <encoding>UTF-8</encoding>
+          <compilerArgs>
+            <arg>-Xlint:all,-options,-processing</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <trimStackTrace>false</trimStackTrace>
+          <environmentVariables>
+            <!-- The tests own the configuration: a developer's real key must never reach the mock. -->
+            <TYPIZER_API_KEY></TYPIZER_API_KEY>
+            <TYPIZER_BASE_URL></TYPIZER_BASE_URL>
+            <TYPIZER_LOG></TYPIZER_LOG>
+          </environmentVariables>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Automatic-Module-Name>ru.typizer</Automatic-Module-Name>
+              <Implementation-Title>typizer-java</Implementation-Title>
+              <Implementation-Version>${project.version}</Implementation-Version>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- JDK 9+ compiles with release 8 (checks the Java 8 API, not just the bytecode level); JDK 8
+         itself has no release flag and uses source/target 1.8 above. -->
+    <profile>
+      <id>release-8</id>
+      <activation>
+        <jdk>[9,)</jdk>
+      </activation>
+      <properties>
+        <maven.compiler.release>8</maven.compiler.release>
+      </properties>
+    </profile>
+
+    <!-- mvn -P release deploy: sources, javadoc, GPG signatures and upload to the Central Portal.
+         Needs the GPG key in the agent (MAVEN_GPG_PASSPHRASE) and a "central" server in
+         settings.xml with a Central Portal user token — see .github/workflows/release.yml. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.10.1</version>
+            <configuration>
+              <doclint>none</doclint>
+              <source>8</source>
+              <excludePackageNames>ru.typizer.internal</excludePackageNames>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.7.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

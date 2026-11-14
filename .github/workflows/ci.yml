@@ -1,0 +1,31 @@
+# JUnit on every supported JDK, on every push and pull request of the package's own public
+# repository (the mirror scripts/export-mirror.sh produces; inert inside the monorepo). The tests
+# start the SDK conformance mock from src/test/mock with Node.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["8", "11", "17", "21", "25"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - run: mvn -B --no-transfer-progress test

@@ -1,0 +1,49 @@
+# Publishes ru.typizer:typizer-java to Maven Central (Sonatype Central Portal) when a v* tag is
+# pushed to the public mirror: tests, sources and javadoc jars, GPG signatures, upload with
+# central-publishing-maven-plugin (pom.xml, profile "release"), waiting until the release is
+# published. Inert inside the monorepo.
+#
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   CENTRAL_TOKEN_USERNAME, CENTRAL_TOKEN_PASSWORD — a user token from central.sonatype.com
+#     (Account → Generate User Token), for the verified namespace ru.typizer;
+#   GPG_PRIVATE_KEY — the armored private signing key (gpg --armor --export-secret-keys <id>);
+#     its public key must be on a public keyserver (keys.openpgp.org / keyserver.ubuntu.com);
+#   GPG_PASSPHRASE — its passphrase.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: The tag is the version in pom.xml
+        run: |
+          version="$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != pom version $version"; exit 1; }
+      - name: Test, sign and publish
+        run: mvn -B --no-transfer-progress -P release deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}

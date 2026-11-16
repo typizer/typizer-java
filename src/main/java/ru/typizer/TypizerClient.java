@@ -50,7 +50,7 @@ import ru.typizer.models.Usage;
  */
 public final class TypizerClient implements AutoCloseable {
     /** Version of this SDK. */
-    public static final String VERSION = "0.1.0";
+    public static final String VERSION = "0.2.0";
     /** {@code https://api.typizer.ru}. */
     public static final String DEFAULT_BASE_URL = "https://api.typizer.ru";
 

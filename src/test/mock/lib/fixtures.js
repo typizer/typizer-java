@@ -287,7 +287,12 @@ export function me() {
     user: null,
     role: null,
     api_key: { id: API_KEY_ID, name: 'Конформанс', scopes: [...SCOPES] },
-    features: { billing_enabled: true, edo_diadoc: false, catalog_community: true, inbound_mail: false },
+    features: {
+      billing_enabled: true,
+      edo_diadoc: false,
+      catalog_community: true,
+      inbound_mail: false,
+    },
   };
 }
 

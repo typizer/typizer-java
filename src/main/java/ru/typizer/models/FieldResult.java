@@ -35,7 +35,8 @@ public final class FieldResult extends TypizerObject {
 
     /**
      * Why the field is {@code warn}: {@code checksum_mismatch}, {@code invalid_format},
-     * {@code sum_mismatch}, {@code implausible_date}, {@code no_source}, …; otherwise {@code null}.
+     * {@code sum_mismatch}, {@code implausible_date}, {@code no_source}, {@code code_mismatch} (the value
+     * contradicts a barcode or QR code printed on the document), …; otherwise {@code null}.
      */
     public String reason() {
         return str("reason");

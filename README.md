@@ -21,20 +21,20 @@ Maven:
 <dependency>
   <groupId>ru.typizer</groupId>
   <artifactId>typizer-java</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 
 Gradle (Kotlin DSL):
 
 ```kotlin
-implementation("ru.typizer:typizer-java:0.1.0")
+implementation("ru.typizer:typizer-java:0.2.0")
 ```
 
 Gradle (Groovy):
 
 ```groovy
-implementation 'ru.typizer:typizer-java:0.1.0'
+implementation 'ru.typizer:typizer-java:0.2.0'
 ```
 
 Артефакт лежит в Maven Central; если сборка ходит через корпоративный Nexus или Artifactory, он

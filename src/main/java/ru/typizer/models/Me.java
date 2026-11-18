@@ -145,7 +145,8 @@ public final class Me extends TypizerObject {
 
     /** Features enabled for the organization. */
     public static final class Features extends TypizerObject {
-        static final Set<String> FIELDS = fields("object", "billing_enabled", "edo_diadoc", "catalog_community", "inbound_mail");
+        static final Set<String> FIELDS = fields("object", "billing_enabled", "edo_diadoc", "catalog_community", "inbound_mail",
+                "validators_suggest");
 
         public Features(Map<String, Object> data) {
             super(data, FIELDS);
@@ -169,6 +170,11 @@ public final class Me extends TypizerObject {
         /** {@code inbound_mail}: приём документов по почте. */
         public boolean inboundMail() {
             return flag("inbound_mail");
+        }
+
+        /** {@code validators_suggest}: {@code validators().suggest(…)} is available. */
+        public boolean validatorsSuggest() {
+            return flag("validators_suggest");
         }
     }
 }

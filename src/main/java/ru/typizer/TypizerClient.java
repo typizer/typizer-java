@@ -50,7 +50,7 @@ import ru.typizer.models.Usage;
  */
 public final class TypizerClient implements AutoCloseable {
     /** Version of this SDK. */
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.3.0";
     /** {@code https://api.typizer.ru}. */
     public static final String DEFAULT_BASE_URL = "https://api.typizer.ru";
 
@@ -64,6 +64,7 @@ public final class TypizerClient implements AutoCloseable {
     private final CatalogService catalog;
     private final BatchService batches;
     private final WebhookEndpointService webhookEndpoints;
+    private final ValidatorService validators;
     private volatile TypizerAsyncClient async;
 
     private TypizerClient(Core core, boolean ownsTransport, ExecutorService executor, ExecutorService ownedExecutor) {
@@ -77,6 +78,7 @@ public final class TypizerClient implements AutoCloseable {
         this.catalog = new CatalogService(core);
         this.batches = new BatchService(core);
         this.webhookEndpoints = new WebhookEndpointService(core);
+        this.validators = new ValidatorService(core);
     }
 
     public static Builder builder() {
@@ -112,6 +114,11 @@ public final class TypizerClient implements AutoCloseable {
 
     public WebhookEndpointService webhookEndpoints() {
         return webhookEndpoints;
+    }
+
+    /** Your own field checks ({@code my/<slug>}): create, version, try on values. */
+    public ValidatorService validators() {
+        return validators;
     }
 
     // ---------------------------------------------------------------- extract

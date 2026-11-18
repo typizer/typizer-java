@@ -13,6 +13,7 @@ import ru.typizer.models.CatalogPublisher;
 import ru.typizer.models.CatalogReport;
 import ru.typizer.models.CatalogVersionBrief;
 import ru.typizer.models.Typizer;
+import ru.typizer.models.Validator;
 
 /**
  * The schema catalog: {@code client.catalog()}. A reference ({@code ref}) is a slug of an official
@@ -23,10 +24,30 @@ import ru.typizer.models.Typizer;
 public final class CatalogService {
     private final Core core;
     private final Publishers publishers;
+    /** {@code null} for schemas (the API's default), {@code "validator"} for {@link #validators()}. */
+    private final String type;
+    private final Validators validators;
 
     CatalogService(Core core) {
+        this(core, null);
+    }
+
+    private CatalogService(Core core, String type) {
         this.core = core;
+        this.type = type;
         this.publishers = new Publishers(core);
+        this.validators = type == null ? new Validators(new CatalogService(core, CatalogEntryBrief.TYPE_VALIDATOR)) : null;
+    }
+
+    /**
+     * The catalog's field validators — official ones ({@code inn}, {@code iban}, {@code vin}…) and
+     * those organizations published. They need no install: a field refers to one by
+     * {@link ru.typizer.models.CatalogValidatorBrief#ref()}; {@link Validators#fork} makes your own
+     * copy {@code my/<slug>} to change.
+     */
+    public Validators validators() {
+        if (validators == null) throw new IllegalStateException("validators() of the validator catalog");
+        return validators;
     }
 
     /** {@code GET /v1/catalog}. */
@@ -39,7 +60,9 @@ public final class CatalogService {
     }
 
     public Page<CatalogEntryBrief> list(CatalogListParams params, RequestOptions options) {
-        Map<String, Object> q = params != null ? params.query : new LinkedHashMap<String, Object>();
+        Map<String, Object> q = new LinkedHashMap<>();
+        if (type != null) q.put("type", type);
+        if (params != null) q.putAll(params.query);
         return RunService.page(core, Op.listCatalog, new String[0], q, "cursor", options, CatalogEntryBrief::new);
     }
 
@@ -61,7 +84,7 @@ public final class CatalogService {
         Core.Call call = r.publisher != null
                 ? new Core.Call(Op.getCommunityCatalogEntry, r.publisher, r.slug)
                 : new Core.Call(Op.getCatalogEntry, r.slug);
-        return core.json(call.query("version", r.version).options(options), CatalogEntry::new);
+        return core.json(call.query("version", r.version).query("type", type).options(options), CatalogEntry::new);
     }
 
     /** {@code GET /v1/catalog/{entry}/versions}: every version, newest first (one list, no pages). */
@@ -71,7 +94,7 @@ public final class CatalogService {
 
     @SuppressWarnings("unchecked")
     public List<CatalogVersionBrief> versions(String ref, RequestOptions options) {
-        Map<String, Object> json = core.json(new Core.Call(Op.listCatalogVersions, entry(ref, options)).options(options));
+        Map<String, Object> json = core.json(new Core.Call(Op.listCatalogVersions, entry(ref, options)).query("type", type).options(options));
         List<CatalogVersionBrief> out = new ArrayList<>();
         Object data = json.get("data");
         if (data instanceof List) {
@@ -104,7 +127,7 @@ public final class CatalogService {
         Map<String, Object> body = new LinkedHashMap<>();
         if (r.version != null) body.put("version", r.version);
         if (name != null) body.put("name", name);
-        return core.json(new Core.Call(op, entry(ref, options)).jsonBody(body).options(options), Typizer::new);
+        return core.json(new Core.Call(op, entry(ref, options)).query("type", type).jsonBody(body).options(options), Typizer::new);
     }
 
     /** {@code PUT /v1/catalog/{entry}/favorite}. */
@@ -113,7 +136,7 @@ public final class CatalogService {
     }
 
     public CatalogFavorite favorite(String ref, RequestOptions options) {
-        return core.json(new Core.Call(Op.favoriteCatalogEntry, entry(ref, options)).options(options), CatalogFavorite::new);
+        return core.json(new Core.Call(Op.favoriteCatalogEntry, entry(ref, options)).query("type", type).options(options), CatalogFavorite::new);
     }
 
     /** {@code DELETE /v1/catalog/{entry}/favorite}. */
@@ -122,12 +145,13 @@ public final class CatalogService {
     }
 
     public CatalogFavorite unfavorite(String ref, RequestOptions options) {
-        return core.json(new Core.Call(Op.unfavoriteCatalogEntry, entry(ref, options)).options(options), CatalogFavorite::new);
+        return core.json(new Core.Call(Op.unfavoriteCatalogEntry, entry(ref, options)).query("type", type).options(options), CatalogFavorite::new);
     }
 
     /**
      * {@code POST /v1/catalog/{entry}/reports}: report an entry — {@code reason} is {@code pii},
-     * {@code plagiarism}, {@code broken}, {@code spam} or {@code other}.
+     * {@code plagiarism}, {@code broken}, {@code spam}, {@code other} or, for a validator,
+     * {@code false_positive} (it rejects correct values).
      */
     public CatalogReport report(String ref, String reason) {
         return report(ref, reason, null, RequestOptions.NONE);
@@ -140,7 +164,7 @@ public final class CatalogService {
         body.put("reason", reason);
         if (details != null) body.put("details", details);
         if (r.version != null) body.put("version", r.version);
-        return core.json(new Core.Call(Op.reportCatalogEntry, entry(ref, options)).jsonBody(body).options(options),
+        return core.json(new Core.Call(Op.reportCatalogEntry, entry(ref, options)).query("type", type).jsonBody(body).options(options),
                 CatalogReport::new);
     }
 
@@ -156,7 +180,90 @@ public final class CatalogService {
     private String entry(String ref, RequestOptions options) {
         Ref r = Ref.parse(ref, null);
         if (r.publisher == null) return r.slug;
-        return core.json(new Core.Call(Op.getCommunityCatalogEntry, r.publisher, r.slug).options(options), CatalogEntry::new).id();
+        return core.json(new Core.Call(Op.getCommunityCatalogEntry, r.publisher, r.slug).query("type", type).options(options), CatalogEntry::new).id();
+    }
+
+    /** {@code client.catalog().validators()}: the catalog's field validators. */
+    public static final class Validators {
+        private final CatalogService catalog;
+
+        Validators(CatalogService catalog) {
+            this.catalog = catalog;
+        }
+
+        /** {@code GET /v1/catalog?type=validator}. */
+        public Page<CatalogEntryBrief> list() {
+            return catalog.list();
+        }
+
+        public Page<CatalogEntryBrief> list(CatalogListParams params) {
+            return catalog.list(params);
+        }
+
+        public Page<CatalogEntryBrief> list(CatalogListParams params, RequestOptions options) {
+            return catalog.list(params, options);
+        }
+
+        /** A validator with its version: the rule, published tests and explanation are in {@code version().validator()}. */
+        public CatalogEntry get(String ref) {
+            return catalog.get(ref);
+        }
+
+        public CatalogEntry get(String ref, String version, RequestOptions options) {
+            return catalog.get(ref, version, options);
+        }
+
+        public List<CatalogVersionBrief> versions(String ref) {
+            return catalog.versions(ref);
+        }
+
+        public List<CatalogVersionBrief> versions(String ref, RequestOptions options) {
+            return catalog.versions(ref, options);
+        }
+
+        public CatalogFavorite favorite(String ref) {
+            return catalog.favorite(ref);
+        }
+
+        public CatalogFavorite favorite(String ref, RequestOptions options) {
+            return catalog.favorite(ref, options);
+        }
+
+        public CatalogFavorite unfavorite(String ref) {
+            return catalog.unfavorite(ref);
+        }
+
+        public CatalogFavorite unfavorite(String ref, RequestOptions options) {
+            return catalog.unfavorite(ref, options);
+        }
+
+        /** {@code reason}: {@code false_positive} when the validator rejects correct values, or any schema reason. */
+        public CatalogReport report(String ref, String reason) {
+            return catalog.report(ref, reason);
+        }
+
+        public CatalogReport report(String ref, String reason, String details, RequestOptions options) {
+            return catalog.report(ref, reason, details, options);
+        }
+
+        /**
+         * {@code POST /v1/catalog/{entry}/fork?type=validator}: your own copy {@code my/<slug>} with
+         * the rule and the published tests, to change. A taken slug is a {@code ConflictException}.
+         */
+        public Validator fork(String ref) {
+            return fork(ref, null, null, null, RequestOptions.NONE);
+        }
+
+        /** {@code version} ({@code "1"}, {@code "1.2.0"}), {@code slug} and {@code name} may be null. */
+        public Validator fork(String ref, String version, String slug, String name, RequestOptions options) {
+            Ref r = Ref.parse(ref, version);
+            Map<String, Object> body = new LinkedHashMap<>();
+            if (r.version != null) body.put("version", r.version);
+            if (slug != null) body.put("slug", slug);
+            if (name != null) body.put("name", name);
+            return catalog.core.json(new Core.Call(Op.forkCatalogEntry, catalog.entry(ref, options))
+                    .query("type", catalog.type).jsonBody(body).options(options), Validator::new);
+        }
     }
 
     /** {@code [publisher/]slug[@version]}. */

@@ -30,6 +30,8 @@ import ru.typizer.models.Format;
 import ru.typizer.models.Run;
 import ru.typizer.models.RunStatus;
 import ru.typizer.models.Typizer;
+import ru.typizer.models.Validator;
+import ru.typizer.models.ValidatorTest;
 import ru.typizer.models.WebhookDelivery;
 import ru.typizer.models.WebhookEndpoint;
 import ru.typizer.models.WebhookEventType;
@@ -91,7 +93,7 @@ class ContractTest {
     @Test
     void operationTableMatchesTheOpenApiDocument() {
         Map<String, Object[]> ops = operations();
-        assertEquals(49, ops.size(), "public operations");
+        assertEquals(57, ops.size(), "public operations");
         assertEquals(new TreeSet<>(ops.keySet()), new TreeSet<>(toSet(Op.values())));
         for (Map.Entry<String, Object[]> e : ops.entrySet()) {
             Op op = Op.valueOf(e.getKey());
@@ -146,6 +148,14 @@ class ContractTest {
         c.catalog().report("acme/akt-sverki", "spam");
         Typizer installed = c.catalog().install("schet-faktura");
         c.catalog().fork("upd");
+        // The validator catalog sends ?type=validator (the query table needs every parameter used).
+        c.catalog().validators().list();
+        c.catalog().validators().get("inn@1");
+        c.catalog().validators().versions("inn");
+        c.catalog().validators().favorite("inn");
+        c.catalog().validators().unfavorite("inn");
+        c.catalog().validators().report("inn", "false_positive");
+        c.catalog().validators().fork("inn", null, "my-inn", null, RequestOptions.NONE);
         CatalogUpdate update = c.typizers().catalogUpdate().get(installed.id());
         c.typizers().catalogUpdate().apply(installed.id(), update.to());
 
@@ -171,6 +181,18 @@ class ContractTest {
         c.webhookEndpoints().deliveries().retry(delivery.id());
         c.webhookEndpoints().delete(endpoint.id());
 
+        c.validators().list();
+        c.validators().get("my/contract-no@1");
+        Validator v = c.validators().create(ValidatorParams.builder().name("Код склада").slug("sklad")
+                .spec("{\"kind\":\"rules\",\"applies_to\":\"string\",\"rules\":[{\"type\":\"pattern\",\"pattern\":\"СК-\\\\d{3}\"}],"
+                        + "\"message\":\"Код склада не по шаблону СК-NNN\"}")
+                .tests(ValidatorTest.pass("СК-001")).build());
+        c.validators().get(v.id());
+        c.validators().update(v.id(), ValidatorParams.builder().description("Склад в накладной").build());
+        c.validators().test(Arrays.asList("СК-001", "СК-1"), "my/" + v.slug() + "@1");
+        c.validators().suggest(ValidatorSuggestParams.builder().pass("СК-001").build());
+        c.validators().archive(v.id());
+
         c.files().delete(file.id());
         c.typizers().delete(t.id());
 
@@ -191,10 +213,13 @@ class ContractTest {
         String[] names = {"Run", "File", "Typizer", "TypizerDraft", "TypizerVersion", "Batch", "WebhookEndpoint",
             "WebhookDelivery", "Balance", "BalanceLot", "Me", "Organization", "Usage", "UsageRow", "CatalogEntryBrief",
             "CatalogEntry", "CatalogVersionBrief", "CatalogVersion", "CatalogPublisher", "CatalogPublisherBrief",
-            "CatalogFavorite", "CatalogReport", "CatalogUpdate", "SchemaChange", "Status", "MaintenanceEvent", "Problem"};
+            "CatalogFavorite", "CatalogReport", "CatalogUpdate", "SchemaChange", "Status", "MaintenanceEvent", "Problem",
+            "FieldResult", "FieldCheck", "FieldSource", "RunCheckUsed", "TypizerCheck", "Validator", "CatalogValidatorBrief", "CatalogValidatorVersion",
+            "ValidatorDetail", "ValidatorVersion", "ValidatorTest", "ValidatorUsedBy", "ValidatorUpdateResult",
+            "ValidatorTestResult", "ValidatorSuggestion"};
         try {
             for (String n : names) MODELS.put(n, Class.forName("ru.typizer.models." + n));
-            for (String n : new String[] {"DeletedFile", "DeletedTypizer", "DeletedWebhookEndpoint"})
+            for (String n : new String[] {"DeletedFile", "DeletedTypizer", "DeletedWebhookEndpoint", "DeletedValidator"})
                 MODELS.put(n, Class.forName("ru.typizer.models.Deleted"));
         } catch (ClassNotFoundException e) {
             throw new IllegalStateException(e);

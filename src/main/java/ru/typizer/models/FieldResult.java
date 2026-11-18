@@ -9,7 +9,7 @@ import java.util.Set;
  * does not return a numeric confidence — instead each field says whether its checks passed.
  */
 public final class FieldResult extends TypizerObject {
-    static final Set<String> FIELDS = fields("status", "reason", "sources");
+    static final Set<String> FIELDS = fields("status", "reason", "message", "checks", "sources");
 
     private final String path;
 
@@ -35,11 +35,29 @@ public final class FieldResult extends TypizerObject {
 
     /**
      * Why the field is {@code warn}: {@code checksum_mismatch}, {@code invalid_format},
+     * {@code pattern_mismatch}, {@code not_in_list}, {@code out_of_range}, {@code rule_failed},
      * {@code sum_mismatch}, {@code implausible_date}, {@code no_source}, {@code code_mismatch} (the value
      * contradicts a barcode or QR code printed on the document), …; otherwise {@code null}.
      */
     public String reason() {
         return str("reason");
+    }
+
+    /**
+     * The same reason as a phrase in Russian, ready to show a person (for your own checks — their
+     * {@code message}); {@code null} for {@code ok} fields and in runs and webhooks made before the API
+     * sent it.
+     */
+    public String message() {
+        return str("message");
+    }
+
+    /**
+     * The checks of the field and how each went: official ({@code inn}), yours ({@code my/…}), written
+     * into the schema ({@code inline}); empty when the field has none.
+     */
+    public List<FieldCheck> checks() {
+        return objects("checks", FieldCheck::new);
     }
 
     /** Where in the document the value was found. */

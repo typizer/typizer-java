@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,6 +43,7 @@ import org.junit.jupiter.api.io.TempDir;
 import ru.typizer.errors.ApiException;
 import ru.typizer.errors.AuthenticationException;
 import ru.typizer.errors.BadRequestException;
+import ru.typizer.errors.ConflictException;
 import ru.typizer.errors.ConnectionException;
 import ru.typizer.errors.FileTooLargeException;
 import ru.typizer.errors.IdempotencyConflictException;
@@ -60,8 +62,21 @@ import ru.typizer.http.UrlConnectionTransport;
 import ru.typizer.internal.Json;
 import ru.typizer.models.Balance;
 import ru.typizer.models.CatalogEntryBrief;
+import ru.typizer.models.CheckStatus;
+import ru.typizer.models.CatalogEntry;
 import ru.typizer.models.Deleted;
+import ru.typizer.models.FieldCheck;
 import ru.typizer.models.FieldResult;
+import ru.typizer.models.FieldWarning;
+import ru.typizer.models.RunCheckUsed;
+import ru.typizer.models.Validator;
+import ru.typizer.models.ValidatorBump;
+import ru.typizer.models.ValidatorDetail;
+import ru.typizer.models.ValidatorSuggestion;
+import ru.typizer.models.ValidatorTest;
+import ru.typizer.models.ValidatorTestResult;
+import ru.typizer.models.ValidatorUpdateResult;
+import ru.typizer.models.ValidatorVersion;
 import ru.typizer.models.FieldSource;
 import ru.typizer.models.FieldStatus;
 import ru.typizer.models.Me;
@@ -381,6 +396,300 @@ class ConformanceTest {
         assertFalse(run.needsReview());
         assertTrue(run.fieldsToReview().isEmpty());
         assertThrows(NotFoundException.class, () -> client.runs().output(run.id()));
+    }
+
+    /** The schema of SC-36: an own check by reference, an inline check, an official check. */
+    static Map<String, Object> checksSchema(String contractCheck) {
+        return Json.parseObject("{\"type\":\"object\",\"properties\":{"
+                + "\"contract_no\":{\"type\":\"string\",\"x-typizer-check\":\"" + contractCheck + "\"},"
+                + "\"spec_no\":{\"type\":\"string\",\"x-typizer-check\":{\"kind\":\"rules\",\"applies_to\":\"string\","
+                + "\"rules\":[{\"type\":\"length\",\"min\":4}],\"message\":\"Номер спецификации короче 4 знаков\"}},"
+                + "\"seller\":{\"type\":\"object\",\"properties\":{\"inn\":{\"type\":\"string\",\"x-typizer-check\":\"inn\"}}}}}");
+    }
+
+    @Test
+    @DisplayName("SC-36 checks: FieldResult message and checks, run.warnings() and checksUsed()")
+    void sc36_checks() {
+        String key = MockServer.key("checks");
+        TypizerClient client = MockServer.client(key);
+        Map<String, Object> schema = checksSchema("my/contract-no@1");
+        Run run = client.extract(ExtractParams.builder().url(SAMPLE_URL).schema(schema).build());
+
+        FieldResult contract = run.fields().get("contract_no");
+        assertEquals(FieldStatus.WARN, contract.status());
+        assertEquals("pattern_mismatch", contract.reason());
+        assertEquals("Номер договора не по шаблону ДГ-ГГГГ/NNNN", contract.message());
+        assertEquals(1, contract.checks().size());
+        FieldCheck check = contract.checks().get(0);
+        assertEquals("my/contract-no", check.ref());
+        assertEquals("1.0.0", check.version());
+        assertEquals("Номер договора", check.name());
+        assertEquals(CheckStatus.FAIL, check.status());
+        assertEquals("fail", check.statusValue());
+        assertEquals("pattern", check.rule());
+        assertEquals("pattern_mismatch", check.reason());
+
+        FieldResult inn = run.fields().get("seller.inn");
+        assertEquals(FieldStatus.OK, inn.status());
+        assertNull(inn.message());
+        assertEquals("inn", inn.checks().get(0).ref());
+        assertEquals(CheckStatus.PASS, inn.checks().get(0).status());
+
+        List<FieldWarning> warnings = run.warnings();
+        assertEquals(2, warnings.size());
+        assertEquals(new FieldWarning("contract_no", "Номер договора не по шаблону ДГ-ГГГГ/NNNN", "pattern_mismatch"),
+                warnings.get(0));
+        assertEquals("spec_no", warnings.get(1).path());
+        assertEquals("Номер спецификации короче 4 знаков", warnings.get(1).message());
+        assertEquals("invalid_format", warnings.get(1).reason());
+
+        List<RunCheckUsed> used = run.checksUsed();
+        assertEquals(2, used.size());
+        assertEquals("my/contract-no", used.get(0).ref());
+        assertEquals("1.0.0", used.get(0).version());
+        assertEquals("Номер договора", used.get(0).name());
+        assertNull(used.get(0).field());
+        assertEquals("inline", used.get(1).ref());
+        assertNull(used.get(1).version());
+        assertNull(used.get(1).name());
+        assertEquals("spec_no", used.get(1).field());
+
+        // The inline check went to the server exactly as written.
+        Map<String, Object> sent = map(map(MockServer.requests(key, "extract").get(0).get("body")).get("value"));
+        assertEquals(schema, sent.get("schema"));
+
+        // A typizer's run: checksUsed() is null, the locked checks are on the typizer.
+        Typizer t = client.typizers().create("Договоры", schema);
+        assertEquals(1, t.checks().size());
+        assertEquals("my/contract-no", t.checks().get(0).ref());
+        assertEquals("1.0.0", t.checks().get(0).version());
+        assertEquals("Номер договора", t.checks().get(0).name());
+        Run typizerRun = client.extract(ExtractParams.builder().url(SAMPLE_URL).typizer(t).build());
+        assertNull(typizerRun.checksUsed());
+
+        // Runs and webhooks made before 1.2: no checks_used, no message, no checks.
+        Run old = new Run(Json.parseObject("{\"id\":\"run_1\",\"status\":\"succeeded\",\"fields\":{"
+                + "\"a\":{\"status\":\"warn\",\"reason\":\"checksum_mismatch\",\"sources\":[]},"
+                + "\"b\":{\"status\":\"missing\",\"sources\":[]}}}"));
+        assertNull(old.checksUsed());
+        assertEquals(1, old.warnings().size());
+        assertEquals(new FieldWarning("a", null, "checksum_mismatch"), old.warnings().get(0));
+        assertTrue(old.fields().get("a").checks().isEmpty());
+        assertTrue(new Run(Json.parseObject("{\"id\":\"run_1\"}")).warnings().isEmpty());
+    }
+
+    @Test
+    @DisplayName("SC-37 own validators: list, get by slug and id, create, update bump, red test, taken slug, archive")
+    void sc37_validators() {
+        String key = MockServer.key("ok");
+        TypizerClient client = MockServer.client(key);
+
+        Validator seeded = null;
+        for (Validator v : client.validators().list().autoPager()) if ("my/contract-no".equals(v.ref())) seeded = v;
+        assertNotNull(seeded);
+        assertEquals("contract-no", seeded.slug());
+        assertEquals("Номер договора", seeded.name());
+        assertEquals("1.0.0", seeded.version().version());
+
+        ValidatorDetail bySlug = client.validators().get("my/contract-no@1");
+        List<Map<String, Object>> slugCalls = MockServer.requests(key, "getValidatorBySlug");
+        assertEquals("/v1/validators/my/contract-no", slugCalls.get(0).get("path"));
+        assertEquals(seeded.id(), bySlug.id());
+        assertEquals(1, bySlug.versions().size());
+        ValidatorVersion v1 = bySlug.versions().get(0);
+        assertEquals("rules", v1.spec().get("kind"));
+        assertEquals(3, v1.tests().size());
+        assertEquals(ValidatorTest.EXPECT_PASS, v1.tests().get(1).expect());
+        assertEquals("регистр не важен", v1.tests().get(1).note());
+        assertNotNull(bySlug.usedBy());
+
+        ValidatorDetail byId = client.validators().get(seeded.id());
+        assertEquals("/v1/validators/" + seeded.id(), MockServer.requests(key, "getValidator").get(0).get("path"));
+        assertEquals(bySlug.versions().size(), byId.versions().size());
+        assertEquals(1, client.validators().versions("my/contract-no").size());
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("kind", "rules");
+        spec.put("applies_to", "string");
+        Map<String, Object> rule = new LinkedHashMap<>();
+        rule.put("type", "pattern");
+        rule.put("pattern", "СП-\\d{4}");
+        spec.put("rules", Collections.singletonList(rule));
+        spec.put("message", "Номер спецификации не по шаблону СП-ГГГГ");
+        Validator created = client.validators().create(ValidatorParams.builder().name("Номер спецификации").slug("spec-no")
+                .spec(spec).tests(ValidatorTest.pass("СП-2026"), ValidatorTest.fail("СП-26")).build());
+        assertEquals("my/spec-no", created.ref());
+        assertEquals("1.0.0", created.version().version());
+        assertEquals(spec, created.version().spec());
+        Map<String, Object> createBody = map(map(MockServer.requests(key, "createValidator").get(0).get("body")).get("value"));
+        assertEquals(spec, createBody.get("spec"));
+
+        ValidatorUpdateResult updated = client.validators().update(created.id(), ValidatorParams.builder()
+                .tests(ValidatorTest.pass("СП-2026"), ValidatorTest.fail("СП-26"), ValidatorTest.pass("СП-2027")).build());
+        assertEquals(ValidatorBump.MINOR, updated.bump());
+        assertEquals("minor", updated.bumpValue());
+        assertEquals("1.1.0", updated.validator().version().version());
+        assertFalse(updated.reasons().isEmpty());
+
+        BadRequestException red = assertThrows(BadRequestException.class, () -> client.validators().create(
+                ValidatorParams.builder().name("Красный").spec(spec).tests(ValidatorTest.fail("СП-2026")).build()));
+        assertEquals("tests/0", red.param());
+        assertThrows(ConflictException.class,
+                () -> client.validators().create(ValidatorParams.builder().name("Ещё").slug("spec-no").spec(spec).build()));
+
+        Typizer t = client.typizers().create("Спецификации", checksSchema("my/spec-no@1"));
+        ConflictException inUse = assertThrows(ConflictException.class, () -> client.validators().archive(created.id()));
+        assertEquals("used_by", inUse.param());
+        assertEquals(t.id(), client.validators().get("my/spec-no").usedBy().get(0).typizerId());
+
+        Validator spare = client.validators().create("Запасная", spec);
+        Deleted archived = client.validators().archive(spare.id());
+        assertTrue(archived.deleted());
+        assertEquals(spare.id(), archived.id());
+
+        // Argument errors before the network.
+        int before = MockServer.requests(key).size();
+        assertThrows(IllegalArgumentException.class, () -> client.validators().create(ValidatorParams.builder().name("x").build()));
+        assertThrows(IllegalArgumentException.class, () -> client.validators().get(" "));
+        assertEquals(before, MockServer.requests(key).size());
+    }
+
+    @Test
+    @DisplayName("SC-38 validators.test with a reference and with a spec; argument and reference errors")
+    void sc38_validatorTest() {
+        String key = MockServer.key("ok");
+        TypizerClient client = MockServer.client(key);
+
+        ValidatorTestResult r = client.validators().test(Arrays.asList("ДГ-2026/0153", "ДГ-26/153"), "my/contract-no@1");
+        assertNotNull(r.explain());
+        assertEquals(2, r.results().size());
+        ValidatorTestResult.Result ok = r.results().get(0);
+        assertEquals("ДГ-2026/0153", ok.value());
+        assertTrue(ok.pass());
+        assertNull(ok.reason());
+        assertNull(ok.message());
+        assertNull(ok.ruleIndex());
+        ValidatorTestResult.Result bad = r.results().get(1);
+        assertFalse(bad.pass());
+        assertEquals("pattern_mismatch", bad.reason());
+        assertEquals("Номер договора не по шаблону ДГ-ГГГГ/NNNN", bad.message());
+        assertEquals(Integer.valueOf(0), bad.ruleIndex());
+        // Tested values are document data: never in toString().
+        assertFalse(r.toString().contains("ДГ-26/153"));
+        assertFalse(bad.toString().contains("ДГ-26/153"));
+
+        Map<String, Object> innSpec = new LinkedHashMap<>();
+        innSpec.put("kind", "native");
+        innSpec.put("id", "inn");
+        ValidatorTestResult bySpec = client.validators().test(
+                ValidatorTestParams.builder().values("7707083893", "7707083894").spec(innSpec).build());
+        assertTrue(bySpec.results().get(0).pass());
+        assertFalse(bySpec.results().get(1).pass());
+        assertNotNull(bySpec.results().get(1).reason());
+        Map<String, Object> sent = map(map(MockServer.requests(key, "testValidator").get(1).get("body")).get("value"));
+        assertEquals(innSpec, sent.get("spec"));
+        assertFalse(sent.containsKey("ref"));
+
+        int before = MockServer.requests(key).size();
+        assertThrows(IllegalArgumentException.class, () -> ValidatorTestParams.builder().values("x").build());
+        assertThrows(IllegalArgumentException.class,
+                () -> ValidatorTestParams.builder().values("x").ref("inn@1").spec(innSpec).build());
+        assertThrows(IllegalArgumentException.class, () -> client.validators().test(Collections.emptyList(), "inn@1"));
+        assertThrows(IllegalArgumentException.class, () -> client.validators().test(Arrays.asList("x"), null));
+        assertEquals(before, MockServer.requests(key).size());
+
+        BadRequestException unknown = assertThrows(BadRequestException.class,
+                () -> client.validators().test(Arrays.asList("x"), "my/nope@1"));
+        assertEquals("ref", unknown.param());
+    }
+
+    @Test
+    @DisplayName("SC-39 validators.suggest from examples and a field; nothing to go on is a BadRequest")
+    void sc39_validatorSuggest() {
+        String key = MockServer.key("ok");
+        TypizerClient client = MockServer.client(key);
+        ValidatorSuggestion s = client.validators().suggest(ValidatorSuggestParams.builder()
+                .pass("ДГ-2024/0153", "ДГ-2023/0001").fail("ДГ-24/153").field("contract_no").build());
+        assertEquals("rules", s.spec().get("kind"));
+        assertEquals(3, s.tests().size());
+        assertEquals("pass", s.tests().get(0).expect());
+        assertEquals("fail", s.tests().get(2).expect());
+        boolean allMatch = true;
+        for (ValidatorSuggestion.SuggestedTest x : s.tests()) allMatch &= x.expect().equals(x.got());
+        assertEquals(allMatch, s.converged());
+        assertNotNull(s.explain());
+        assertEquals("shape", s.source());
+        assertNotNull(s.name());
+        boolean own = false;
+        for (ValidatorSuggestion.Candidate c : s.candidatesFromCatalog())
+            own |= "own".equals(c.kind()) && "my/contract-no@1".equals(c.ref());
+        assertTrue(own, "candidates: " + s.candidatesFromCatalog());
+        Map<String, Object> sent = map(map(MockServer.requests(key, "suggestValidator").get(0).get("body")).get("value"));
+        assertEquals(Arrays.asList("ДГ-2024/0153", "ДГ-2023/0001"), map(sent.get("examples")).get("pass"));
+        assertEquals("contract_no", map(sent.get("field")).get("name"));
+        assertFalse(sent.containsKey("description"));
+
+        assertThrows(BadRequestException.class, () -> client.validators().suggest(ValidatorSuggestParams.builder().build()));
+    }
+
+    @Test
+    @DisplayName("Validator catalog: list and get with type=validator, the published tests, fork into my/<slug>")
+    void validatorCatalog() {
+        TypizerClient client = MockServer.client(MockServer.key("ok"));
+        Page<CatalogEntryBrief> page = client.catalog().validators().list();
+        assertEquals(CatalogEntryBrief.TYPE_VALIDATOR, page.data().get(0).type());
+        assertEquals("inn@1", page.data().get(0).validator().ref());
+        CatalogEntry inn = client.catalog().validators().get("inn@1");
+        assertEquals(5, inn.version().validator().tests().size());
+        assertEquals("10 или 12 цифр", inn.version().validator().rulePreview().get(0));
+        assertEquals("acme/contract-no", client.catalog().validators().get("acme/contract-no").ref());
+        Validator mine = client.catalog().validators().fork("inn", null, "my-inn", "Мой ИНН", RequestOptions.NONE);
+        assertEquals("my/my-inn", mine.ref());
+        assertEquals("Мой ИНН", mine.name());
+        // The schema catalog is unchanged: no type, schema entries.
+        assertEquals(CatalogEntryBrief.TYPE_SCHEMA, client.catalog().list().data().get(0).type());
+    }
+
+    @Test
+    @DisplayName("Validator models keep unknown fields and unknown enum values")
+    void validatorModelsAreOpen() {
+        ValidatorUpdateResult u = new ValidatorUpdateResult(Json.parseObject("{\"object\":\"validator_update\",\"bump\":\"giant\","
+                + "\"validator\":{\"id\":\"val_1\",\"ref\":\"my/x\",\"shiny\":1,\"version\":{\"version\":\"2.0.0\","
+                + "\"spec\":{\"kind\":\"future\",\"x\":[1]},\"tests\":[{\"value\":5,\"expect\":\"maybe\",\"why\":\"n\"}],"
+                + "\"new_field\":true}},\"reasons\":[],\"propagated_to\":[{\"typizer_id\":\"tz_1\",\"version\":3}],"
+                + "\"suggested_to\":[\"tz_2\"],\"later\":\"x\"}"));
+        assertEquals(ValidatorBump.UNKNOWN, u.bump());
+        assertEquals("giant", u.bumpValue());
+        assertEquals("x", u.extra().get("later"));
+        assertEquals(1L, ((Number) u.validator().extra().get("shiny")).longValue());
+        ValidatorVersion v = u.validator().version();
+        assertEquals(Boolean.TRUE, v.extra().get("new_field"));
+        assertEquals("future", v.spec().get("kind"));
+        assertEquals(5L, ((Number) v.tests().get(0).value()).longValue());
+        assertEquals("maybe", v.tests().get(0).expect());
+        assertEquals("n", v.tests().get(0).extra().get("why"));
+        assertEquals("tz_1", u.propagatedTo().get(0).typizerId());
+        assertEquals(Integer.valueOf(3), u.propagatedTo().get(0).version());
+        assertEquals(Collections.singletonList("tz_2"), u.suggestedTo());
+
+        FieldCheck fc = new FieldCheck(Json.parseObject("{\"ref\":\"doc:abc\",\"status\":\"maybe\",\"weight\":2}"));
+        assertEquals(CheckStatus.UNKNOWN, fc.status());
+        assertEquals("maybe", fc.statusValue());
+        assertEquals(2L, ((Number) fc.extra().get("weight")).longValue());
+        RunCheckUsed rc = new RunCheckUsed(Json.parseObject("{\"ref\":\"inline\",\"version\":null,\"name\":null,\"field\":\"a\",\"x\":1}"));
+        assertNull(rc.version());
+        assertTrue(rc.extra().containsKey("x"));
+
+        ValidatorDetail d = new ValidatorDetail(Json.parseObject("{\"id\":\"val_1\",\"versions\":[],\"used_by\":"
+                + "[{\"typizer_id\":\"tz_1\",\"update_available\":null,\"extra\":true}]}"));
+        assertInstanceOf(Validator.class, d);
+        assertNull(d.usedBy().get(0).updateAvailable());
+        assertTrue(d.usedBy().get(0).extra().containsKey("extra"));
+        assertTrue(new Validator(Json.parseObject("{}")).toString().startsWith("Validator{"));
+        // Test values may come from documents: never in toString().
+        assertFalse(v.toString().contains("5"));
+        assertFalse(ValidatorTest.pass("ДГ-2026/0153").toString().contains("ДГ"));
+        assertThrows(IllegalArgumentException.class, () -> ValidatorTest.pass(new Object()));
     }
 
     @Test

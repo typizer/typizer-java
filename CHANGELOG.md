@@ -3,6 +3,31 @@
 Все заметные изменения этого пакета. Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [0.3.0] — 2026-11-18
+
+Совместимо с 0.2.0: прежние вызовы работают без изменений.
+
+### Добавлено
+
+- Проверки полей: `client.validators()` — свои проверки `my/<slug>`: `list()` (с `autoPager()`),
+  `get(id или "my/slug")`, `create`, `update` (`ValidatorUpdateResult` с `bump()`), `archive`,
+  `versions`, `test(values, ref)` / `test(ValidatorTestParams)` и `suggest(ValidatorSuggestParams)`;
+  параметры `ValidatorParams`, `ValidatorTestParams`, `ValidatorSuggestParams`; модели `Validator`,
+  `ValidatorDetail`, `ValidatorVersion`, `ValidatorTest`, `ValidatorUsedBy`, `ValidatorUpdateResult`,
+  `ValidatorTestResult`, `ValidatorSuggestion`, открытые перечисления `ValidatorBump` и `CheckStatus`.
+  `spec` — свободный `Map` (принимается также JSON-текстом или деревом Jackson/Gson).
+- `FieldResult.message()` и `FieldResult.checks()` (`FieldCheck`), `Run.warnings()` (`FieldWarning`:
+  путь, сообщение, причина), `Run.checksUsed()` (`RunCheckUsed`), `Typizer.checks()` и
+  `TypizerVersion.checks()` (`TypizerCheck`), `Me.Features.validatorsSuggest()`. Прогоны и вебхуки
+  без этих полей разбираются как раньше.
+- Каталог проверок: `client.catalog().validators()` — `list`, `get`, `versions`, `favorite`,
+  `unfavorite`, `report` (причина `false_positive`) и `fork` (своя копия `my/<slug>`, ответ —
+  `Validator`). У записей каталога — `type()` (`CatalogEntryBrief.TYPE_SCHEMA`/`TYPE_VALIDATOR`),
+  `rulePreview()` и `validator()` (`CatalogValidatorBrief`), у версии — `validator()`
+  (`CatalogValidatorVersion`: правило, опубликованные примеры, объяснение).
+- `FieldCheck.corrected()` — значение прочитано повторно после проваленной проверки («Перечитать при
+  ошибке», режим «Точный»).
+
 ## [0.2.0] — 2026-11-16
 
 Совместимо с 0.1.0: прежние вызовы работают без изменений.

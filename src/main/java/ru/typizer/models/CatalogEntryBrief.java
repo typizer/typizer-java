@@ -7,7 +7,7 @@ import java.util.Set;
 
 /** A catalog entry as listed by {@code catalog().list()}. */
 public class CatalogEntryBrief extends TypizerObject {
-    static final Set<String> FIELDS = fields("object", "id", "ref", "kind", "slug", "title", "summary", "category", "tags", "publisher", "featured", "latest_version", "fields_preview", "stats", "web_url", "updated_at", "viewer");
+    static final Set<String> FIELDS = fields("object", "id", "type", "ref", "kind", "slug", "title", "summary", "category", "tags", "publisher", "featured", "latest_version", "fields_preview", "rule_preview", "validator", "stats", "web_url", "updated_at", "viewer");
 
     public CatalogEntryBrief(Map<String, Object> data) {
         super(data, FIELDS);
@@ -75,6 +75,30 @@ public class CatalogEntryBrief extends TypizerObject {
     /** {@code fields_preview}. */
     public List<String> fieldsPreview() {
         return strings("fields_preview");
+    }
+
+    /** {@code type} of a schema entry. */
+    public static final String TYPE_SCHEMA = "schema";
+    /** {@code type} of a field validator entry. */
+    public static final String TYPE_VALIDATOR = "validator";
+
+    /**
+     * {@code schema} — a document schema (added to your typizers) or {@code validator} — a field
+     * check (a field refers to it in {@code x-typizer-check}, nothing to install). A newer value is
+     * kept as is.
+     */
+    public String type() {
+        return str("type");
+    }
+
+    /** A validator's rule as short chips («2 буквы», «–», «4 цифры»); {@code null} for a schema. */
+    public List<String> rulePreview() {
+        return strings("rule_preview");
+    }
+
+    /** What a field refers to and the rule; {@code null} for a schema. */
+    public CatalogValidatorBrief validator() {
+        return object("validator", CatalogValidatorBrief::new);
     }
 
     /** {@code stats}. */

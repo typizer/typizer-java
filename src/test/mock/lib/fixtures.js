@@ -140,7 +140,12 @@ export function extraction(schema, { review = false } = {}) {
       setAtPath(output, path, null);
       fields[path] = { status: 'missing', sources: [] };
     } else if (review && i === 0) {
-      fields[path] = { status: 'warn', reason: 'checksum_mismatch', sources: [source] };
+      fields[path] = {
+        status: 'warn',
+        reason: 'checksum_mismatch',
+        message: 'Не сходится контрольное число',
+        sources: [source],
+      };
     } else {
       fields[path] = { status: 'ok', sources: [source] };
     }
@@ -177,6 +182,7 @@ export function run(o) {
     batch_id: null,
     metadata: {},
     catalog: null,
+    checks_used: null,
     created_at: o.created_at,
     completed_at: null,
     ...o,
@@ -211,6 +217,7 @@ export function typizer(o) {
     default_format: o.default_format ?? 'json',
     mode: o.mode ?? 'standard',
     catalog_source: o.catalog_source ?? null,
+    checks: o.checks ?? [],
     created_at: o.created_at,
     updated_at: o.updated_at ?? o.created_at,
   };
@@ -231,6 +238,7 @@ export function typizerVersion(
     version,
     schema,
     instructions,
+    checks: t.checks ?? [],
     created_at: createdAt,
   };
 }
@@ -292,6 +300,7 @@ export function me() {
       edo_diadoc: false,
       catalog_community: true,
       inbound_mail: false,
+      validators_suggest: true,
     },
   };
 }
@@ -408,12 +417,73 @@ export const CATALOG = [
   },
 ];
 
-/** A catalog entry by `cat_…` id, slug of an official schema, or `publisher/slug` ref. */
-export function findCatalog(ref) {
+/** The validator catalog (`?type=validator`): an official validator and a community one. */
+export const VALIDATOR_CATALOG = [
+  {
+    id: makeId('cat', 'validator:inn'),
+    type: 'validator',
+    ref: 'inn',
+    kind: 'official',
+    slug: 'inn',
+    title: 'ИНН',
+    summary: 'ИНН организации (10 цифр) или физлица и ИП (12 цифр) с проверкой контрольных цифр.',
+    category: 'requisites',
+    publisher: TYPIZER_PUBLISHER,
+    spec: { kind: 'native', id: 'inn' },
+    tests: [
+      { value: '0012345673', expect: 'pass' },
+      { value: '001234567887', expect: 'pass' },
+      { value: '0011223344', expect: 'pass' },
+      { value: '0012345674', expect: 'fail' },
+      { value: '001234567', expect: 'fail' },
+    ],
+    explain: '10 или 12 цифр, контрольные цифры по алгоритму ФНС.',
+    rule_preview: ['10 или 12 цифр', 'контрольная сумма'],
+    version: '1.0.0',
+    web_url: 'https://typizer.ru/validators/inn/',
+  },
+  {
+    id: makeId('cat', 'validator:acme/contract-no'),
+    type: 'validator',
+    ref: 'acme/contract-no',
+    kind: 'community',
+    slug: 'contract-no',
+    title: 'Номер договора',
+    summary: 'Номер договора вида ДГ-ГГГГ/NNNN.',
+    category: 'text',
+    publisher: ACME_PUBLISHER,
+    spec: {
+      kind: 'rules',
+      applies_to: 'string',
+      rules: [{ type: 'pattern', pattern: 'ДГ-\\d{4}/\\d{4}' }],
+      message: 'Номер договора не по шаблону ДГ-ГГГГ/NNNN',
+    },
+    tests: [
+      { value: 'ДГ-2026/0153', expect: 'pass' },
+      { value: 'ДГ-2025/0001', expect: 'pass' },
+      { value: 'ДГ-2024/9999', expect: 'pass' },
+      { value: 'ДГ-26/153', expect: 'fail' },
+      { value: '2026/0153', expect: 'fail' },
+    ],
+    explain: 'ДГ, дефис, четыре цифры, косая черта, четыре цифры.',
+    rule_preview: ['ДГ', '–', '4 цифры', '/', '4 цифры'],
+    version: '1.0.0',
+    web_url: null,
+  },
+];
+
+/**
+ * A catalog entry by `cat_…` id, slug of an official entry, or `publisher/slug` ref; `type`
+ * (`schema` by default, as the API) picks the schema or the validator catalog — a slug may be in
+ * both. An id finds either.
+ */
+export function findCatalog(ref, type = 'schema') {
   const bare = ref.split('@')[0];
-  return CATALOG.find(
-    (c) => c.id === bare || c.ref === bare || (c.kind === 'official' && c.slug === bare),
-  );
+  const all = [...CATALOG, ...VALIDATOR_CATALOG];
+  const byId = all.find((c) => c.id === bare);
+  if (byId) return byId;
+  const pool = type === 'validator' ? VALIDATOR_CATALOG : CATALOG;
+  return pool.find((c) => c.ref === bare || (c.kind === 'official' && c.slug === bare));
 }
 
 /** @param {(typeof CATALOG)[number]} c */
@@ -425,7 +495,7 @@ function versionBrief(c) {
     major: Number(c.version.split('.')[0]),
     breaking: false,
     changelog: 'Уточнены описания полей.',
-    field_count: Object.keys(c.schema.properties).length,
+    field_count: c.schema ? Object.keys(c.schema.properties).length : 0,
     published_at: '2026-11-01T00:00:00.000Z',
   };
 }
@@ -435,6 +505,7 @@ export function catalogBrief(c, viewer = {}) {
   return {
     id: c.id,
     object: 'catalog_entry',
+    type: c.type ?? 'schema',
     ref: c.ref,
     kind: c.kind,
     slug: c.slug,
@@ -445,7 +516,13 @@ export function catalogBrief(c, viewer = {}) {
     publisher: c.publisher,
     featured: c.kind === 'official',
     latest_version: versionBrief(c),
-    fields_preview: Object.keys(c.schema.properties).slice(0, 6),
+    fields_preview: c.schema ? Object.keys(c.schema.properties).slice(0, 6) : [],
+    ...(c.type === 'validator'
+      ? {
+          rule_preview: c.rule_preview,
+          validator: { ref: `${c.ref}@${c.version.split('.')[0]}`, spec: c.spec },
+        }
+      : {}),
     stats: { orgs_30d: c.kind === 'official' ? 120 : null, favorites: 7 },
     web_url: c.web_url,
     updated_at: '2026-11-01T00:00:00.000Z',
@@ -461,13 +538,30 @@ export function catalogEntry(c, viewer = {}) {
     description: c.kind === 'community' ? 'Схема для актов сверки.' : null,
     prompt: null,
     visibility: 'public',
-    version: {
-      ...versionBrief(c),
-      schema: c.schema,
-      instructions: '',
-      example_output: c.kind === 'official' ? sampleValue(c.schema) : null,
-      changes: [{ path: 'seller.kpp', kind: 'description_changed', breaking: false }],
-    },
+    version:
+      c.type === 'validator'
+        ? {
+            ...versionBrief(c),
+            schema: {},
+            instructions: '',
+            example_output: null,
+            changes: [],
+            validator: {
+              ref: `${c.ref}@${c.version.split('.')[0]}`,
+              spec: c.spec,
+              tests: c.tests,
+              tests_hidden: 0,
+              explain: c.explain,
+              rule_preview: c.rule_preview,
+            },
+          }
+        : {
+            ...versionBrief(c),
+            schema: c.schema,
+            instructions: '',
+            example_output: c.kind === 'official' ? sampleValue(c.schema) : null,
+            changes: [{ path: 'seller.kpp', kind: 'description_changed', breaking: false }],
+          },
     majors: [{ major: Number(c.version.split('.')[0]), latest: c.version }],
     lineage: null,
     viewer: { favorited: Boolean(viewer.favorited), typizers: [] },
@@ -541,5 +635,105 @@ export function catalogUpdate(t) {
         conflict: false,
       },
     ],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Field checks and validators (custom validators spec 2026-11-15, §4.7, §8)
+
+/**
+ * The built-in requisite checks as `checks[]` shows them (mirrors `@typizer/core` BUILTIN_CHECKS):
+ * the Russian name, the rule that decides a pass and the warn texts. All are at `1.0.0`.
+ */
+export const OFFICIAL_CHECKS = {
+  inn: {
+    name: 'ИНН',
+    rule: 'checksum',
+    format: 'ИНН должен состоять из 10 или 12 цифр',
+    checksum: 'Не сходится контрольное число ИНН',
+  },
+  kpp: {
+    name: 'КПП',
+    rule: 'format',
+    format: 'КПП — 9 знаков: 4 цифры, 2 цифры или заглавные латинские буквы, 3 цифры',
+  },
+  ogrn: {
+    name: 'ОГРН',
+    rule: 'checksum',
+    format: 'ОГРН — 13 цифр, ОГРНИП — 15 цифр',
+    checksum: 'Не сходится контрольное число ОГРН',
+  },
+  bik: { name: 'БИК', rule: 'format', format: 'БИК — 9 цифр, начинается с 00–04' },
+  snils: {
+    name: 'СНИЛС',
+    rule: 'checksum',
+    format: 'СНИЛС должен состоять из 11 цифр',
+    checksum: 'Не сходится контрольное число СНИЛС',
+  },
+};
+
+/** `WARN_MESSAGES_RU` of `@typizer/core` — the generic Russian text per `reason`. */
+export const WARN_MESSAGES_RU = {
+  checksum_mismatch: 'Не сходится контрольное число',
+  invalid_format: 'Неверный формат',
+  pattern_mismatch: 'Значение не подходит под шаблон из схемы',
+  not_in_list: 'Значения нет в списке допустимых',
+  out_of_range: 'Значение вне допустимого диапазона',
+  sum_mismatch: 'Сумма позиций не равна итогу',
+  rule_failed: 'Не выполнено правило проверки',
+  implausible_date: 'Год даты вне 1900–2100 — проверьте дату',
+  no_source: 'Не нашли, где это значение в документе',
+  code_mismatch: 'Не совпадает со штрихкодом или QR-кодом на документе',
+};
+
+/** The organization's own validator every key starts with: «Номер договора» (`my/contract-no`). */
+export const CONTRACT_NO_VALIDATOR = {
+  slug: 'contract-no',
+  name: 'Номер договора',
+  description: 'Номер договора в шапке: ДГ-ГГГГ/NNNN',
+  spec: {
+    kind: 'rules',
+    applies_to: 'string',
+    normalize: { strip: ['spaces'], case: 'upper' },
+    rules: [{ type: 'pattern', pattern: 'ДГ-\\d{4}/\\d{4}' }],
+    message: 'Номер договора не по шаблону ДГ-ГГГГ/NNNN',
+  },
+  tests: [
+    { value: 'ДГ-2026/0153', expect: 'pass' },
+    { value: 'дг-2025/0001', expect: 'pass', note: 'регистр не важен' },
+    { value: 'ДГ-26/153', expect: 'fail' },
+  ],
+};
+
+/** @param {Record<string, any>} o */
+export function validatorVersion(o) {
+  return {
+    id: o.id,
+    object: 'validator_version',
+    version: o.version,
+    spec: o.spec,
+    tests: o.tests ?? [],
+    explain: o.explain,
+    rule_preview: o.rule_preview,
+    changelog: o.changelog ?? '',
+    created_at: o.created_at,
+  };
+}
+
+/** @param {Record<string, any>} o `{id, slug, name, description, versions (newest first), created_at, updated_at}` */
+export function validator(o) {
+  return {
+    id: o.id,
+    object: 'validator',
+    ref: `my/${o.slug}`,
+    slug: o.slug,
+    name: o.name,
+    description: o.description ?? null,
+    version: o.versions[0],
+    versions_count: o.versions.length,
+    catalog: null,
+    forked_from: null,
+    created_at: o.created_at,
+    updated_at: o.updated_at ?? o.created_at,
   };
 }

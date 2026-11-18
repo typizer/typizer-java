@@ -21,20 +21,20 @@ Maven:
 <dependency>
   <groupId>ru.typizer</groupId>
   <artifactId>typizer-java</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
 
 Gradle (Kotlin DSL):
 
 ```kotlin
-implementation("ru.typizer:typizer-java:0.2.0")
+implementation("ru.typizer:typizer-java:0.3.0")
 ```
 
 Gradle (Groovy):
 
 ```groovy
-implementation 'ru.typizer:typizer-java:0.2.0'
+implementation 'ru.typizer:typizer-java:0.3.0'
 ```
 
 Артефакт лежит в Maven Central; если сборка ходит через корпоративный Nexus или Artifactory, он
@@ -138,6 +138,56 @@ TypizerClient client = TypizerClient.fromEnv();
 Run run = client.extract(Paths.get("invoice.pdf"), new String(Files.readAllBytes(Paths.get("invoice.schema.json")), StandardCharsets.UTF_8));
 Invoice invoice = run.outputAs(Invoice.class);   // или run.outputJson() — в любую свою библиотеку
 System.out.println(invoice.total);
+```
+
+### Проверки полей
+
+`x-typizer-check` в схеме — проверка значения поля: официальная (`"inn"`, `"inn@1"`), своя
+(`"my/contract@1"`) или прямо объект с правилами (`{"kind": "rules", …}` — SDK передаёт его как
+есть). Не прошедшее проверку поле приходит со статусом `warn`; `run.warnings()` — такие поля по
+порядку: путь, готовая фраза по-русски для человека (`message()`) и код причины (`reason()`). У
+каждого поля `FieldResult.checks()` — какие проверки и с каким итогом сработали (`FieldCheck`:
+`ref()`, `version()`, `status()` — `pass`, `fail`, `skipped`); у прогона разовой схемы
+`run.checksUsed()` — проверки на точных версиях, у типизатора — `Typizer.checks()`.
+
+Свои проверки — `client.validators()`: `create`, `get("my/contract")` или по `val_…`, `list()`
+(с `autoPager()`), `update` (ответ говорит, какую версию это дало: `bump()` — `major`, `minor`,
+`patch`, `none`), `archive`, `versions`, `test` — попробовать на значениях, ничего не сохраняя, и
+`suggest` — черновик проверки по описанию и примерам. Тесты версии (`ValidatorTest.pass/fail`) —
+её контракт: красный тест — `BadRequestException` с `param()` вида `tests/0`, а архивировать
+проверку, на которую ссылается типизатор, нельзя — `ConflictException` с `param()` `used_by`.
+
+Готовые проверки каталога (ИНН, IBAN, VIN и другие) подключаются ссылкой без установки:
+`"x-typizer-check": "iban@1"`. Список — `client.catalog().validators().list()`, своя копия для
+правки — `client.catalog().validators().fork("iban@1")`.
+
+```java
+TypizerClient client = TypizerClient.fromEnv();
+
+// Своя проверка «Номер договора»: ДГ-ГГГГ/NNNN, без учёта пробелов и регистра
+Validator contract = client.validators().create(ValidatorParams.builder()
+        .name("Номер договора")
+        .slug("contract")                                      // ссылка my/contract
+        .spec("{\"kind\": \"rules\", \"applies_to\": \"string\","
+                + " \"normalize\": {\"strip\": [\"spaces\"], \"case\": \"upper\"},"
+                + " \"rules\": [{\"type\": \"pattern\", \"pattern\": \"ДГ-\\\\d{4}/\\\\d{4}\"}],"
+                + " \"message\": \"Номер договора не по шаблону ДГ-ГГГГ/NNNN\"}")
+        .tests(ValidatorTest.pass("ДГ-2026/0153"), ValidatorTest.pass("дг-2026/0001"), ValidatorTest.fail("ДГ-26/153"))
+        .build());
+
+// Попробовать на значениях до того, как ставить в схему
+ValidatorTestResult test = client.validators().test(Arrays.asList("дг-2026/0153", "ДГ-26/153"), "my/contract@1");
+for (ValidatorTestResult.Result r : test.results()) {
+    System.out.println(r.value() + ": " + (r.pass() ? "ок" : r.message()));
+}
+
+String schema = "{\"type\": \"object\", \"properties\": {"
+        + "\"invoice_number\": {\"type\": \"string\"},"
+        + "\"contract_no\": {\"type\": \"string\", \"x-typizer-check\": \"my/contract@1\"}}}";
+Run run = client.extract(Paths.get("invoice.pdf"), schema);
+for (FieldWarning w : run.warnings()) {
+    System.out.println(w.path() + ": " + w.message());  // contract_no: Номер договора не по шаблону ДГ-ГГГГ/NNNN
+}
 ```
 
 ## Схема из каталога

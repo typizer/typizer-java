@@ -28,6 +28,8 @@ export const SCENARIOS = {
   run_failed: 'Runs end `failed` with run.error.code `document_unreadable`.',
   output_expired:
     'Runs succeed with output/fields null and output_expired true; GET /v1/runs/{id}/output is 404.',
+  checks:
+    'Like ok, but every own (`my/…`) or inline `x-typizer-check` fails: the field is `warn` with `reason`, `message` and a failed entry in `checks`; official checks pass.',
   slow: 'Runs are always queued (202, whatever `wait`); GET /v1/runs/{id} answers processing twice and the final run on the 3rd poll.',
   unauthorized: 'Every authenticated call is 401 unauthorized.',
   insufficient_scope: 'Every authenticated call except GET /v1/me is 403 insufficient_scope.',
@@ -107,6 +109,8 @@ const ID_PREFIX = {
   batch: 'batch',
   endpoint: 'whe',
   delivery: 'whd',
+  validator: 'val',
+  validator_version: 'valv',
 };
 const MAINTENANCE = {
   id: fx.makeId('mnt', 'maintenance'),
@@ -603,6 +607,7 @@ class State {
     /** @type {Map<string, any>} */ this.endpoints = new Map();
     /** @type {Map<string, any>} */ this.deliveries = new Map();
     /** @type {Set<string>} */ this.favorites = new Set();
+    /** @type {Map<string, { v: any, versions: any[] }>} */ this.validators = new Map();
     this.seed();
   }
 
@@ -692,6 +697,15 @@ class State {
         created_at: fx.at(-1000),
       }),
     });
+    // Seeded last, so every id above stays what it was before validators existed.
+    const valId = this.id('validator');
+    const c = fx.CONTRACT_NO_VALIDATOR;
+    const valCreated = fx.at(-95000);
+    const first = validatorVersionOf(this, c.spec, c.tests, '1.0.0', '', valCreated);
+    this.validators.set(valId, {
+      v: fx.validator({ id: valId, ...c, versions: [first], created_at: valCreated }),
+      versions: [first],
+    });
   }
 }
 
@@ -767,8 +781,10 @@ export const HANDLERS = {
   createTypizer: ({ state, body }) => {
     const bad = schemaProblem(body?.schema);
     if (bad) return bad;
+    const lock = lockChecks(state, body.schema);
+    if (lock.error) return lock.error;
     const id = state.id('typizer');
-    const t = fx.typizer({ id, ...body, created_at: state.now() });
+    const t = fx.typizer({ id, ...body, checks: lock.checks, created_at: state.now() });
     state.typizers.set(id, t);
     state.versions.set(id, [fx.typizerVersion(t, 1, t.created_at)]);
     return { status: 201, body: t };
@@ -796,11 +812,16 @@ export const HANDLERS = {
   updateTypizer: (ctx) =>
     withEntity(ctx, 'typizers', 'typizer', (t) => {
       const { body = {} } = ctx;
+      /** @type {any[]} */
+      let checks = t.checks ?? [];
       if (body.schema !== undefined) {
         const bad = schemaProblem(body.schema);
         if (bad) return bad;
+        const lock = lockChecks(ctx.state, body.schema);
+        if (lock.error) return lock.error;
+        checks = lock.checks;
       }
-      const updated = { ...t, ...body, updated_at: ctx.state.now() };
+      const updated = { ...t, ...body, checks, updated_at: ctx.state.now() };
       if (body.schema !== undefined || body.instructions !== undefined) {
         updated.version = t.version + 1;
         ctx.state.versions
@@ -844,14 +865,15 @@ export const HANDLERS = {
 
   // Catalog
   listCatalog: ({ state, query }) => {
-    let items = fx.CATALOG.filter(
+    const pool = query.type === 'validator' ? fx.VALIDATOR_CATALOG : fx.CATALOG;
+    let items = pool.filter(
       (c) =>
         (!query.category || c.category === query.category) &&
         (!query.kind || c.kind === query.kind) &&
         (!query.publisher || c.publisher.slug === query.publisher) &&
         (!query.favorites || state.favorites.has(c.id)) &&
         (!query.q ||
-          `${c.title} ${c.summary} ${Object.keys(c.schema.properties).join(' ')}`
+          `${c.title} ${c.summary} ${Object.keys(c.schema?.properties ?? {}).join(' ')}`
             .toLowerCase()
             .includes(String(query.q).toLowerCase())),
     );
@@ -908,10 +930,11 @@ export const HANDLERS = {
       return { status: 201, body: typizerFromCatalog(ctx.state, c, 'installed', ctx.body?.name) };
     }),
   forkCatalogEntry: (ctx) =>
-    withCatalog(ctx, ctx.params.entry, (c) => ({
-      status: 201,
-      body: typizerFromCatalog(ctx.state, c, 'forked', ctx.body?.name),
-    })),
+    withCatalog(ctx, ctx.params.entry, (c) =>
+      c.type === 'validator'
+        ? validatorFromCatalog(ctx.state, c, ctx.body ?? {})
+        : { status: 201, body: typizerFromCatalog(ctx.state, c, 'forked', ctx.body?.name) },
+    ),
   favoriteCatalogEntry: (ctx) =>
     withCatalog(ctx, ctx.params.entry, (c) => {
       ctx.state.favorites.add(c.id);
@@ -927,7 +950,19 @@ export const HANDLERS = {
     }),
   reportCatalogEntry: (ctx) =>
     withCatalog(ctx, ctx.params.entry, (c) => {
-      if (c.kind === 'official' && !['broken', 'other'].includes(ctx.body?.reason)) {
+      if (ctx.body?.reason === 'false_positive' && c.type !== 'validator') {
+        return {
+          error: 'invalid_request',
+          detail: 'false_positive is a reason for validators only',
+          param: 'reason',
+        };
+      }
+      const officialReasons = [
+        'broken',
+        'other',
+        ...(c.type === 'validator' ? ['false_positive'] : []),
+      ];
+      if (c.kind === 'official' && !officialReasons.includes(ctx.body?.reason)) {
         return {
           error: 'invalid_request',
           detail: 'Official schemas can only be reported as broken or other',
@@ -957,6 +992,229 @@ export const HANDLERS = {
       ctx.state.typizers.set(t.id, updated);
       return { status: 200, body: updated };
     }),
+
+  // Validators (custom validators spec 2026-11-15, §8.1)
+  listValidators: ({ state, query }) =>
+    page(
+      sorted(new Map([...state.validators].map(([id, e]) => [id, e.v]))),
+      query,
+      'starting_after',
+    ),
+  createValidator: ({ state, body = {} }) => {
+    const bad = specProblem(body.spec, 'spec');
+    if (bad) return bad;
+    const slug = body.slug ?? slugFrom(body.name, state);
+    if (validatorBySlug(state, slug))
+      return {
+        error: 'conflict',
+        detail: `Проверка my/${slug} уже есть`,
+        param: 'slug',
+      };
+    const red = redTest(body.spec, body.tests ?? []);
+    if (red) return red;
+    const id = state.id('validator');
+    const created = state.now();
+    const first = validatorVersionOf(
+      state,
+      body.spec,
+      body.tests ?? [],
+      '1.0.0',
+      body.changelog ?? '',
+      created,
+    );
+    const v = fx.validator({
+      id,
+      slug,
+      name: body.name,
+      description: body.description ?? null,
+      versions: [first],
+      created_at: created,
+    });
+    state.validators.set(id, { v, versions: [first] });
+    return { status: 201, body: v };
+  },
+  getValidator: (ctx) =>
+    withValidator(ctx, (e) => ({ status: 200, body: validatorDetail(ctx.state, e) })),
+  getValidatorBySlug: (ctx) => {
+    const e = validatorBySlug(ctx.state, String(ctx.params.slug));
+    return e
+      ? { status: 200, body: validatorDetail(ctx.state, e) }
+      : { error: 'not_found', detail: `Проверка my/${ctx.params.slug} не найдена` };
+  },
+  updateValidator: (ctx) =>
+    withValidator(ctx, (e) => {
+      const { body = {}, state } = ctx;
+      if (body.spec !== undefined) {
+        const bad = specProblem(body.spec, 'spec');
+        if (bad) return bad;
+      }
+      const cur = e.versions[0];
+      const spec = body.spec ?? cur.spec;
+      const tests = body.tests ?? cur.tests;
+      const red = redTest(spec, tests);
+      if (red) return red;
+      const specChanged = stableStringify(spec) !== stableStringify(cur.spec);
+      const testsChanged = stableStringify(tests) !== stableStringify(cur.tests);
+      const removedTest = cur.tests.some(
+        (t) => !tests.some((n) => stableStringify(n) === stableStringify(t)),
+      );
+      const metaChanged =
+        (body.name !== undefined && body.name !== e.v.name) ||
+        (body.description !== undefined && body.description !== e.v.description);
+      /** @type {'major' | 'minor' | 'patch' | 'none'} */
+      let bump = 'none';
+      /** @type {string[]} */
+      const reasons = [];
+      if (removedTest || (spec.applies_to ?? null) !== (cur.spec.applies_to ?? null)) {
+        bump = 'major';
+        reasons.push(removedTest ? 'Удалён тест' : 'Изменился тип значения');
+      } else if (specChanged || testsChanged) {
+        bump = 'minor';
+        reasons.push(
+          specChanged ? 'Изменились правила, прежние тесты проходят' : 'Добавлены тесты',
+        );
+      } else if (metaChanged) {
+        bump = 'patch';
+        reasons.push('Изменились только название или описание');
+      }
+      let v = {
+        ...e.v,
+        name: body.name ?? e.v.name,
+        description: body.description !== undefined ? body.description : e.v.description,
+      };
+      if (bump !== 'none') {
+        const [ma, mi, pa] = cur.version.split('.').map(Number);
+        const next =
+          bump === 'major'
+            ? `${ma + 1}.0.0`
+            : bump === 'minor'
+              ? `${ma}.${mi + 1}.0`
+              : `${ma}.${mi}.${pa + 1}`;
+        const at = state.now();
+        const nv = validatorVersionOf(state, spec, tests, next, body.changelog ?? '', at);
+        e.versions.unshift(nv);
+        v = { ...v, version: nv, versions_count: e.versions.length, updated_at: at };
+      }
+      e.v = v;
+      return {
+        status: 200,
+        body: {
+          object: 'validator_update',
+          validator: v,
+          bump,
+          reasons,
+          propagated_to: [],
+          suggested_to: [],
+        },
+      };
+    }),
+  deleteValidator: (ctx) =>
+    withValidator(ctx, (e) => {
+      const users = usersOf(ctx.state, e.v.slug);
+      if (users.length > 0)
+        return {
+          error: 'conflict',
+          detail: `Проверка используется в типизаторах: ${users.map((u) => u.typizer_id).join(', ')}`,
+          param: 'used_by',
+        };
+      ctx.state.validators.delete(e.v.id);
+      return { status: 200, body: { id: e.v.id, object: 'validator', deleted: true } };
+    }),
+  testValidator: ({ state, body = {} }) => {
+    if ((body.ref === undefined) === (body.spec === undefined))
+      return { error: 'invalid_request', detail: 'Передайте ref или spec', param: 'spec' };
+    let spec = body.spec;
+    if (spec !== undefined) {
+      const bad = specProblem(spec, 'spec');
+      if (bad) return bad;
+    } else {
+      const found = resolveCheck(state, String(body.ref));
+      if (!found || found.inline)
+        return {
+          error: 'invalid_request',
+          detail: `Проверка ${body.ref} не найдена`,
+          param: 'ref',
+        };
+      spec = found.spec;
+    }
+    return {
+      status: 200,
+      body: {
+        object: 'validator_test',
+        explain: explainSpec(spec),
+        results: body.values.map((value) => {
+          const r = evaluateSpec(spec, value);
+          return r.pass
+            ? { value, pass: true, reason: null, message: null, rule_index: null }
+            : {
+                value,
+                pass: false,
+                reason: r.reason,
+                message: r.message,
+                rule_index: r.rule_index,
+              };
+        }),
+      },
+    };
+  },
+  suggestValidator: ({ state, body = {} }) => {
+    const pass = body.examples?.pass ?? [];
+    const failing = body.examples?.fail ?? [];
+    if (!body.description && pass.length === 0)
+      return {
+        error: 'invalid_request',
+        detail: 'Опишите проверку словами или дайте примеры, которые должны пройти',
+        param: 'examples',
+      };
+    const fieldName = String(body.field?.name ?? '').toLowerCase();
+    /** @type {any[]} */
+    const candidates = [];
+    for (const id of Object.keys(fx.OFFICIAL_CHECKS)) {
+      if (fieldName.includes(id))
+        candidates.push({
+          ref: `${id}@1`,
+          name: fx.OFFICIAL_CHECKS[id].name,
+          kind: 'official',
+          explain: explainSpec({ kind: 'native', id }),
+        });
+    }
+    const own = [...state.validators.values()].find(
+      (e) => pass.length > 0 && pass.every((x) => evaluateSpec(e.versions[0].spec, x).pass),
+    );
+    if (own)
+      candidates.push({
+        ref: `${own.v.ref}@${own.versions[0].version.split('.')[0]}`,
+        name: own.v.name,
+        kind: 'own',
+        explain: own.versions[0].explain,
+      });
+    const pattern = pass.length > 0 ? shapeOf(String(pass[0])) : '.+';
+    const spec = {
+      kind: 'rules',
+      applies_to: 'string',
+      rules: [{ type: 'pattern', pattern }],
+      message: `${body.field?.name ? `Поле «${body.field.name}»` : 'Значение'} не по шаблону`,
+    };
+    const tests = [
+      ...pass.map((value) => ({ value, expect: 'pass' })),
+      ...failing.map((value) => ({ value, expect: 'fail' })),
+    ].map((t) => ({ ...t, got: evaluateSpec(spec, t.value).pass ? 'pass' : 'fail' }));
+    return {
+      status: 200,
+      body: {
+        object: 'validator_suggestion',
+        name: body.field?.name ? String(body.field.name).slice(0, 80) : 'Новая проверка',
+        spec,
+        tests,
+        converged: tests.every((t) => t.got === t.expect),
+        explain: explainSpec(spec),
+        rule_preview: previewSpec(spec),
+        iterations: 0,
+        source: 'shape',
+        candidates_from_catalog: candidates,
+      },
+    };
+  },
 
   // Runs
   extract: (ctx) => {
@@ -990,6 +1248,8 @@ export const HANDLERS = {
     } else {
       const bad = schemaProblem(schema);
       if (bad) return bad;
+      const lock = lockChecks(ctx.state, schema);
+      if (lock.error) return lock.error;
     }
     return startRun(ctx, { schema, catalog, typizer: null });
   },
@@ -1386,7 +1646,7 @@ function startRun(ctx, o) {
     batch_id: o.batchId ?? null,
     pages: { physical: 1, billed: null },
   });
-  const final = finalState(o.schema, scenario, state);
+  const final = finalState(o.schema, scenario, state, !o.typizer);
   const wait = Number(ctx.query.wait ?? 0);
   const location = { location: `/v1/runs/${id}` };
   if (!o.forceQueued && scenario !== 'slow' && wait > 0) {
@@ -1399,8 +1659,8 @@ function startRun(ctx, o) {
   return { status: 202, body: queued, headers: location };
 }
 
-/** @param {any} schema @param {string} scenario @param {State} state */
-function finalState(schema, scenario, state) {
+/** @param {any} schema @param {string} scenario @param {State} state @param {boolean} [oneOff] a run of a one-off schema (not a typizer's) */
+function finalState(schema, scenario, state, oneOff = false) {
   const completed_at = fx.at(state.clock + 2);
   if (scenario === 'run_failed') {
     return {
@@ -1425,7 +1685,13 @@ function finalState(schema, scenario, state) {
   }
   return {
     status: 'succeeded',
-    ...fx.extraction(schema, { review: scenario === 'needs_review' }),
+    ...withFieldChecks(
+      state,
+      schema,
+      scenario,
+      fx.extraction(schema, { review: scenario === 'needs_review' }),
+      oneOff,
+    ),
     pages: { physical: 1, billed: 1 },
     completed_at,
   };
@@ -1480,9 +1746,36 @@ function withEntity(ctx, map, kind, fn) {
 }
 
 /** @param {Ctx} _ctx @param {string} ref @param {(c: any) => HandlerResult} fn @returns {HandlerResult} */
-function withCatalog(_ctx, ref, fn) {
-  const c = fx.findCatalog(ref);
-  return c ? fn(c) : { error: 'not_found', detail: `No catalog schema "${ref}"`, param: 'entry' };
+function withCatalog(ctx, ref, fn) {
+  const type = ctx.query?.type === 'validator' ? 'validator' : 'schema';
+  const c = fx.findCatalog(ref, type);
+  return c ? fn(c) : { error: 'not_found', detail: `No catalog ${type} "${ref}"`, param: 'entry' };
+}
+
+/**
+ * Fork of a catalog validator (`?type=validator`): the organization's own `my/<slug>` with the
+ * catalog rule and its published tests. A taken slug is a 409 with param slug.
+ * @param {State} state @param {any} c @param {{ slug?: string, name?: string }} body
+ */
+function validatorFromCatalog(state, c, body) {
+  const slug = body.slug ?? c.slug;
+  if (validatorBySlug(state, slug))
+    return { error: 'conflict', detail: `Проверка my/${slug} уже есть`, param: 'slug' };
+  const id = state.id('validator');
+  const created = state.now();
+  const first = validatorVersionOf(state, c.spec, c.tests, '1.0.0', '', created);
+  const v = {
+    ...fx.validator({
+      id,
+      slug,
+      name: body.name ?? c.title,
+      versions: [first],
+      created_at: created,
+    }),
+    forked_from: { ref: `${c.ref}@${c.version.split('.')[0]}`, version: c.version },
+  };
+  state.validators.set(id, { v, versions: [first] });
+  return { status: 201, body: v };
 }
 
 /** @param {string} id @param {keyof typeof ID_PREFIX} kind */
@@ -1844,3 +2137,492 @@ function xsdFor(schema) {
 // recognisable placeholder bytes with the right Content-Type instead of real spreadsheets.
 const XLSX_PLACEHOLDER = Buffer.from('PK\u0003\u0004typizer-mock-xlsx', 'latin1');
 const ZIP_PLACEHOLDER = Buffer.from('PK\u0003\u0004typizer-mock-zip', 'latin1');
+
+// ---------------------------------------------------------------------------------------------
+// Validators: a small, deterministic stand-in for the API's evaluator (enough for SDK tests —
+// the real one lives in @typizer/core and is not a dependency of this zero-dependency mock).
+
+const TRANSLIT = Object.fromEntries(
+  [
+    ...'а:a б:b в:v г:g д:d е:e ё:e ж:zh з:z и:i й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:sch ъ: ы:y ь: э:e ю:yu я:ya'.split(
+      ' ',
+    ),
+  ].map((p) => p.split(':')),
+);
+const VALIDATOR_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const NATIVE_IDS = new Set(Object.keys(fx.OFFICIAL_CHECKS));
+/** `reason` per rule type (spec §4.2). */
+const RULE_REASON = {
+  pattern: 'pattern_mismatch',
+  length: 'invalid_format',
+  charset: 'invalid_format',
+  checksum: 'checksum_mismatch',
+  one_of: 'not_in_list',
+  dictionary: 'not_in_list',
+  range: 'out_of_range',
+  date_range: 'out_of_range',
+  prefix: 'invalid_format',
+};
+const RULE_CHIP = {
+  pattern: 'шаблон',
+  length: 'длина',
+  charset: 'символы',
+  checksum: 'контрольная сумма',
+  one_of: 'список значений',
+  dictionary: 'справочник',
+  range: 'диапазон',
+  date_range: 'даты',
+  prefix: 'начало',
+  official: 'официальная проверка',
+};
+
+/** @param {State} state @param {string} spec @param {any[]} tests @param {string} version @param {string} changelog @param {string} at */
+function validatorVersionOf(state, spec, tests, version, changelog, at) {
+  return fx.validatorVersion({
+    id: state.id('validator_version'),
+    version,
+    spec,
+    tests,
+    explain: explainSpec(spec),
+    rule_preview: previewSpec(spec),
+    changelog,
+    created_at: at,
+  });
+}
+
+/** @param {State} state @param {{ v: any, versions: any[] }} e */
+function validatorDetail(state, e) {
+  return { ...e.v, versions: e.versions, used_by: usersOf(state, e.v.slug) };
+}
+
+/** @param {Ctx} ctx @param {(e: { v: any, versions: any[] }) => HandlerResult} fn @returns {HandlerResult} */
+function withValidator(ctx, fn) {
+  const id = String(ctx.params.id);
+  if (!isValidId(id, 'validator'))
+    return { error: 'invalid_id', detail: `"${id}" is not a val_… id`, param: 'id' };
+  const e = ctx.state.validators.get(id);
+  return e ? fn(e) : { error: 'not_found', detail: 'Проверка не найдена' };
+}
+
+/** @param {State} state @param {string} slug */
+function validatorBySlug(state, slug) {
+  return [...state.validators.values()].find((e) => e.v.slug === slug);
+}
+
+/** @param {unknown} name @param {State} state */
+function slugFrom(name, state) {
+  let out = '';
+  for (const ch of String(name ?? '').toLowerCase()) {
+    if (/[a-z0-9]/.test(ch)) out += ch;
+    else if (Object.hasOwn(TRANSLIT, ch)) out += TRANSLIT[ch];
+    else out += '-';
+  }
+  const slug = out.replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 64).replace(/-$/, '');
+  const base = VALIDATOR_SLUG_RE.test(slug) ? slug : 'validator';
+  return validatorBySlug(state, base) ? `${base}-${state.counter + 1}` : base;
+}
+
+/** A spec the API would reject, reduced to what an SDK can trip. @param {unknown} spec @param {string} param */
+function specProblem(spec, param) {
+  if (!isPlainObject(spec))
+    return { error: 'invalid_request', detail: 'spec must be a JSON object', param };
+  if (spec.kind === 'native') {
+    return NATIVE_IDS.has(String(spec.id))
+      ? null
+      : { error: 'invalid_request', detail: 'Unknown native validator', param: `${param}#/id` };
+  }
+  if (spec.kind !== 'rules')
+    return { error: 'invalid_request', detail: 'kind must be rules', param: `${param}#/kind` };
+  if (!Array.isArray(spec.rules) || spec.rules.length < 1 || spec.rules.length > 10)
+    return { error: 'invalid_request', detail: '1 to 10 rules', param: `${param}#/rules` };
+  if (typeof spec.message !== 'string' || spec.message.length < 1 || spec.message.length > 200)
+    return { error: 'invalid_request', detail: 'message is required', param: `${param}#/message` };
+  for (const [i, rule] of spec.rules.entries()) {
+    if (!isPlainObject(rule) || typeof rule.type !== 'string')
+      return { error: 'invalid_request', detail: 'rule type', param: `${param}#/rules/${i}` };
+    if (rule.type === 'pattern') {
+      try {
+        new RegExp(String(rule.pattern), 'u');
+      } catch {
+        return {
+          error: 'invalid_request',
+          detail: 'Шаблон не разбирается',
+          param: `${param}#/rules/${i}/pattern`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** 400 `tests/<i>` for the first test the spec does not agree with (like the API). */
+function redTest(spec, tests) {
+  for (const [i, t] of tests.entries()) {
+    const got = evaluateSpec(spec, t.value).pass ? 'pass' : 'fail';
+    if (got !== t.expect)
+      return {
+        error: 'invalid_request',
+        detail:
+          t.expect === 'pass'
+            ? `Пример tests[${i}] должен проходить, а проверка его отклоняет`
+            : `Пример tests[${i}] не должен проходить, а проверка его принимает`,
+        param: `tests/${i}`,
+      };
+  }
+  return null;
+}
+
+/**
+ * What an `x-typizer-check` value names: a legacy/official check (`inn`, `inn@1`), the key's own
+ * validator (`my/contract-no[@1]`), an inline spec (an object), or `null` when it names nothing.
+ * @param {State} state @param {unknown} check
+ * @returns {{ ref: string, version: string | null, name: string | null, spec: any, inline?: boolean } | null}
+ */
+function resolveCheck(state, check) {
+  if (isPlainObject(check))
+    return { ref: 'inline', version: null, name: null, spec: check, inline: true };
+  if (typeof check !== 'string') return null;
+  const [bare] = check.split('@');
+  if (NATIVE_IDS.has(bare))
+    return {
+      ref: bare,
+      version: '1.0.0',
+      name: fx.OFFICIAL_CHECKS[bare].name,
+      spec: { kind: 'native', id: bare },
+    };
+  if (bare.startsWith('my/')) {
+    const e = validatorBySlug(state, bare.slice(3));
+    if (!e) return null;
+    return { ref: bare, version: e.versions[0].version, name: e.v.name, spec: e.versions[0].spec };
+  }
+  return null;
+}
+
+/** Every `x-typizer-check` of a schema with its JSON pointer and field path, in document order. */
+function checksIn(schema, pointer = '', path = '') {
+  /** @type {Array<{ check: unknown, pointer: string, path: string, name: string }>} */
+  const out = [];
+  if (!isPlainObject(schema)) return out;
+  if (schema['x-typizer-check'] !== undefined)
+    out.push({
+      check: schema['x-typizer-check'],
+      pointer: `${pointer}/x-typizer-check`,
+      path,
+      name:
+        path
+          .split(/[.[\]]/)
+          .filter(Boolean)
+          .pop() ?? '',
+    });
+  if (isPlainObject(schema.properties))
+    for (const [k, sub] of Object.entries(schema.properties))
+      out.push(...checksIn(sub, `${pointer}/properties/${k}`, path ? `${path}.${k}` : k));
+  if (isPlainObject(schema.items))
+    out.push(...checksIn(schema.items, `${pointer}/items`, `${path}[]`));
+  return out;
+}
+
+/**
+ * The API's check lock, reduced: 400 `invalid_request` (`param: schema#/…/x-typizer-check`) for a
+ * `my/…` ref the key does not have; else the `checks` of a typizer (refs with versions).
+ * @param {State} state @param {any} schema
+ */
+function lockChecks(state, schema) {
+  /** @type {any[]} */
+  const checks = [];
+  for (const c of checksIn(schema)) {
+    if (typeof c.check !== 'string' || c.check === 'sum_of') continue;
+    const r = resolveCheck(state, c.check);
+    if (!r) {
+      if (c.check.startsWith('my/'))
+        return {
+          error: {
+            error: 'invalid_request',
+            detail: `Проверка ${c.check.split('@')[0]} не найдена`,
+            param: `schema#${c.pointer}`,
+          },
+        };
+      continue;
+    }
+    if (!c.check.includes('@') && !c.check.startsWith('my/')) continue; // legacy `inn`: not locked
+    if (!checks.some((x) => x.ref === r.ref))
+      checks.push({ ref: r.ref, version: r.version, name: r.name });
+  }
+  return { checks };
+}
+
+/** Users of `my/<slug>` among the key's typizers (`used_by`). @param {State} state @param {string} slug */
+function usersOf(state, slug) {
+  return sorted(state.typizers).flatMap((t) => {
+    const use = checksIn(t.schema).find(
+      (c) => typeof c.check === 'string' && c.check.split('@')[0] === `my/${slug}`,
+    );
+    if (!use) return [];
+    const e = validatorBySlug(state, slug);
+    return [
+      {
+        typizer_id: t.id,
+        name: t.name,
+        version: t.version,
+        ref: String(use.check),
+        locked_version: e?.versions[0].version ?? '1.0.0',
+        update_available: null,
+      },
+    ];
+  });
+}
+
+/** @param {any} spec @param {unknown} raw */
+function normalized(spec, raw) {
+  let v = String(raw);
+  const n = spec.normalize ?? {};
+  if (n.trim !== false) v = v.trim();
+  const strip = { spaces: / /g, hyphens: /-/g, dots: /\./g, slashes: /\//g, nbsp: / /g };
+  for (const s of n.strip ?? []) if (strip[s]) v = v.replace(strip[s], '');
+  if (n.case === 'upper') v = v.toUpperCase();
+  if (n.case === 'lower') v = v.toLowerCase();
+  return v;
+}
+
+/** The INN check digits (10 or 12 digits). @param {string} s */
+function innValid(s) {
+  if (!/^\d{10}$|^\d{12}$/.test(s)) return null;
+  const d = [...s].map(Number);
+  const ctl = (w) => (w.reduce((a, x, i) => a + x * d[i], 0) % 11) % 10;
+  if (s.length === 10) return ctl([2, 4, 10, 3, 5, 9, 4, 6, 8]) === d[9];
+  return (
+    ctl([7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) === d[10] &&
+    ctl([3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) === d[11]
+  );
+}
+
+/** @param {string} id @param {unknown} value */
+function evaluateNative(id, value) {
+  const info = fx.OFFICIAL_CHECKS[id];
+  const s = String(value).replace(/[\s\- ]/g, '');
+  const shape = {
+    inn: /^\d{10}$|^\d{12}$/,
+    kpp: /^\d{4}[\dA-Z]{2}\d{3}$/,
+    ogrn: /^\d{13}$|^\d{15}$/,
+    bik: /^0[0-4]\d{7}$/,
+    snils: /^\d{11}$/,
+  }[id];
+  if (shape && !shape.test(s))
+    return {
+      pass: false,
+      rule_index: 0,
+      rule: 'format',
+      reason: 'invalid_format',
+      message: info.format,
+    };
+  if (id === 'inn' && innValid(s) === false)
+    return {
+      pass: false,
+      rule_index: 0,
+      rule: 'checksum',
+      reason: 'checksum_mismatch',
+      message: info.checksum,
+    };
+  return { pass: true };
+}
+
+/**
+ * Evaluates a validator spec on one value (spec §4.2): every rule in order, the first failure
+ * reported. Rule types the mock does not model (dictionary, date_range, checksum other than luhn)
+ * pass.
+ * @param {any} spec @param {unknown} value
+ * @returns {{ pass: true } | { pass: false, rule_index: number, rule: string, reason: string, message: string }}
+ */
+function evaluateSpec(spec, value) {
+  if (spec.kind === 'native') return evaluateNative(String(spec.id), value);
+  if (typeof value !== 'string' && typeof value !== 'number')
+    return {
+      pass: false,
+      rule_index: 0,
+      rule: 'type',
+      reason: 'invalid_format',
+      message: spec.message,
+    };
+  const v = normalized(spec, value);
+  for (const [i, rule] of (spec.rules ?? []).entries()) {
+    let ok = true;
+    switch (rule.type) {
+      case 'pattern': {
+        const src = rule.match === 'contains' ? rule.pattern : `^(?:${rule.pattern})$`;
+        ok = new RegExp(src, rule.ignore_case ? 'iu' : 'u').test(v) !== Boolean(rule.negate);
+        break;
+      }
+      case 'length': {
+        const n = [...v].length;
+        ok =
+          (rule.min === undefined || n >= rule.min) &&
+          (rule.max === undefined || n <= rule.max) &&
+          (!Array.isArray(rule.one_of) || rule.one_of.includes(n));
+        break;
+      }
+      case 'one_of':
+        ok = (rule.values ?? []).some((x) =>
+          rule.ignore_case ? String(x).toLowerCase() === v.toLowerCase() : String(x) === v,
+        );
+        break;
+      case 'prefix':
+        ok = (rule.values ?? []).some((x) => v.startsWith(String(x)));
+        break;
+      case 'range': {
+        const n = Number(typeof value === 'number' ? value : v.replace(',', '.'));
+        ok =
+          Number.isFinite(n) &&
+          (rule.min === undefined || (rule.exclusive ? n > rule.min : n >= rule.min)) &&
+          (rule.max === undefined || (rule.exclusive ? n < rule.max : n <= rule.max));
+        break;
+      }
+      case 'checksum':
+        if (rule.algorithm === 'luhn') {
+          const digits = [...v].reverse().map(Number);
+          ok =
+            digits.every((d) => Number.isInteger(d)) &&
+            digits.reduce((a, d, j) => a + (j % 2 ? (d * 2 > 9 ? d * 2 - 9 : d * 2) : d), 0) %
+              10 ===
+              0;
+        }
+        break;
+      case 'official': {
+        const r = evaluateNative(String(rule.ref).split('@')[0], v);
+        if (!r.pass)
+          return {
+            pass: false,
+            rule_index: i,
+            rule: 'official',
+            reason: r.reason,
+            message: spec.rule_messages?.[i] ?? r.message,
+          };
+        break;
+      }
+      default:
+        break;
+    }
+    if (!ok)
+      return {
+        pass: false,
+        rule_index: i,
+        rule: rule.type,
+        reason: RULE_REASON[rule.type] ?? 'rule_failed',
+        message: spec.rule_messages?.[i] ?? spec.message,
+      };
+  }
+  return { pass: true };
+}
+
+/** A Russian one-liner of what the spec checks. @param {any} spec */
+function explainSpec(spec) {
+  if (spec.kind === 'native')
+    return `Официальная проверка: ${fx.OFFICIAL_CHECKS[spec.id]?.name ?? spec.id}`;
+  return `Проверяется: ${previewSpec(spec).join(', ')}`;
+}
+
+/** Rule chips. @param {any} spec */
+function previewSpec(spec) {
+  if (spec.kind === 'native') return [fx.OFFICIAL_CHECKS[spec.id]?.name ?? String(spec.id)];
+  return (spec.rules ?? []).map((r) =>
+    r.type === 'pattern' ? `шаблон ${r.pattern}` : (RULE_CHIP[r.type] ?? String(r.type)),
+  );
+}
+
+/** A pattern of the example's shape: letters, digits, the rest literal (`ДГ-2026/0153` → `[А-ЯЁ]{2}-\d{4}/\d{4}`). @param {string} s */
+function shapeOf(s) {
+  const classOf = (ch) =>
+    /\d/.test(ch)
+      ? '\\d'
+      : /[А-ЯЁ]/.test(ch)
+        ? '[А-ЯЁ]'
+        : /[а-яё]/.test(ch)
+          ? '[а-яё]'
+          : /[A-Z]/.test(ch)
+            ? '[A-Z]'
+            : /[a-z]/.test(ch)
+              ? '[a-z]'
+              : ch.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  let out = '';
+  let prev = '';
+  let n = 0;
+  const flush = () => {
+    if (prev) out += n > 1 ? `${prev}{${n}}` : prev;
+  };
+  for (const ch of s) {
+    const c = classOf(ch);
+    if (c === prev) n++;
+    else {
+      flush();
+      prev = c;
+      n = 1;
+    }
+  }
+  flush();
+  return out;
+}
+
+/**
+ * Adds the API's field checks to a finished run (spec §4.7): every leaf whose schema carries an
+ * `x-typizer-check` (or is named like a requisite) lists its check; in the `checks` scenario an own
+ * or inline check fails. `checks_used` is set for a one-off schema, `null` for a typizer's run.
+ * @param {State} state @param {any} schema @param {string} scenario @param {{ output: any, fields: Record<string, any> }} x @param {boolean} oneOff
+ */
+function withFieldChecks(state, schema, scenario, x, oneOff) {
+  /** @type {any[]} */
+  const used = [];
+  const byPath = new Map(checksIn(schema).map((c) => [c.path, c]));
+  for (const [path, field] of Object.entries(x.fields)) {
+    if (field.status === 'missing') continue;
+    const shapePath = path.replace(/\[\d+\]/g, '[]');
+    const name =
+      path
+        .split(/[.[\]]/)
+        .filter(Boolean)
+        .pop() ?? '';
+    const declared = byPath.get(shapePath);
+    const check = declared?.check ?? (NATIVE_IDS.has(name) ? name : undefined);
+    if (check === undefined) continue;
+    const r = resolveCheck(state, check);
+    if (!r) continue;
+    if (
+      oneOff &&
+      (r.inline || (typeof check === 'string' && (check.includes('@') || check.startsWith('my/'))))
+    ) {
+      const entry = r.inline
+        ? { ref: 'inline', version: null, name: null, field: shapePath }
+        : { ref: r.ref, version: r.version, name: r.name };
+      if (!used.some((u) => u.ref === entry.ref && u.field === entry.field)) used.push(entry);
+    }
+    const base = {
+      ref: r.ref,
+      ...(r.version ? { version: r.version } : {}),
+      ...(r.name ? { name: r.name } : {}),
+    };
+    const own = r.inline || r.ref.startsWith('my/');
+    if (scenario === 'checks' && own) {
+      const rule = r.spec.rules?.[0]?.type ?? 'pattern';
+      const reason = RULE_REASON[rule] ?? 'rule_failed';
+      x.fields[path] = {
+        status: 'warn',
+        reason,
+        message: r.spec.message ?? fx.WARN_MESSAGES_RU[reason],
+        checks: [{ ...base, status: 'fail', rule, reason }],
+        sources: field.sources,
+      };
+    } else if (field.status === 'ok') {
+      x.fields[path] = {
+        ...field,
+        checks: [
+          {
+            ...base,
+            status: 'pass',
+            ...(r.spec.kind === 'native'
+              ? { rule: fx.OFFICIAL_CHECKS[r.ref]?.rule ?? 'checksum' }
+              : {}),
+          },
+        ],
+      };
+    }
+  }
+  return { ...x, checks_used: oneOff ? used : null };
+}

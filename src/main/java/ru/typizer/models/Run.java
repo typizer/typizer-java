@@ -22,7 +22,7 @@ import ru.typizer.internal.OutputMapper;
 public final class Run extends TypizerObject {
     static final Set<String> FIELDS = fields("object", "id", "status", "typizer_id", "typizer_version", "mode",
             "format", "source", "pages", "output", "fields", "output_expired", "error", "file_id", "file", "batch_id",
-            "metadata", "catalog", "created_at", "completed_at");
+            "metadata", "catalog", "checks_used", "created_at", "completed_at");
 
     private volatile Map<String, FieldResult> fieldResults;
 
@@ -152,6 +152,32 @@ public final class Run extends TypizerObject {
             if (f.status() != FieldStatus.OK) out.add(f);
         }
         return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * Fields whose value failed a check (status {@code warn}), in the order of {@link #fields()}: path,
+     * the message to show a person and the reason code. {@code missing} fields are not here — they
+     * have no value to check. Empty when there are none or there is no result.
+     */
+    public List<FieldWarning> warnings() {
+        Map<String, FieldResult> all = fields();
+        if (all == null) return Collections.emptyList();
+        List<FieldWarning> out = new ArrayList<>();
+        for (FieldResult f : all.values()) {
+            if (f.status() == FieldStatus.WARN) out.add(new FieldWarning(f.path(), f.message(), f.reason()));
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * The checks a run of a one-off schema used: references on their exact versions and checks
+     * written into the schema ({@code ref = "inline"}, with {@link RunCheckUsed#field()}). {@code null}
+     * for a typizer's run (its checks are in {@link Typizer#checks()}) and in webhooks sent before the
+     * field existed.
+     */
+    public List<RunCheckUsed> checksUsed() {
+        if (!(get("checks_used") instanceof List)) return null;
+        return objects("checks_used", RunCheckUsed::new);
     }
 
     /** The result was deleted after the retention period: {@link #output()} and {@link #fields()} are null. */

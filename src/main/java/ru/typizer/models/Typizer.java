@@ -1,12 +1,13 @@
 package ru.typizer.models;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /** A typizer: a JSON Schema saved once and run by its id ({@code tz_…}). */
 public final class Typizer extends TypizerObject {
-    static final Set<String> FIELDS = fields("object", "id", "name", "description", "version", "schema", "instructions", "default_format", "mode", "catalog_source", "created_at", "updated_at");
+    static final Set<String> FIELDS = fields("object", "id", "name", "description", "version", "schema", "instructions", "default_format", "mode", "catalog_source", "checks", "created_at", "updated_at");
 
     public Typizer(Map<String, Object> data) {
         super(data, FIELDS);
@@ -65,6 +66,14 @@ public final class Typizer extends TypizerObject {
     /** {@code catalog_source}. */
     public Map<String, Object> catalogSource() {
         return map("catalog_source");
+    }
+
+    /**
+     * The checks the current version is locked on (references in {@code x-typizer-check} with their
+     * exact versions); empty when there are none and in answers made before the API sent it.
+     */
+    public List<TypizerCheck> checks() {
+        return objects("checks", TypizerCheck::new);
     }
 
     /** {@code created_at}. */

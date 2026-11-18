@@ -1,12 +1,13 @@
 package ru.typizer.models;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /** One saved version of a typizer's schema. */
 public final class TypizerVersion extends TypizerObject {
-    static final Set<String> FIELDS = fields("object", "id", "typizer_id", "version", "schema", "instructions", "created_at");
+    static final Set<String> FIELDS = fields("object", "id", "typizer_id", "version", "schema", "instructions", "checks", "created_at");
 
     public TypizerVersion(Map<String, Object> data) {
         super(data, FIELDS);
@@ -35,6 +36,11 @@ public final class TypizerVersion extends TypizerObject {
     /** {@code instructions}. */
     public String instructions() {
         return str("instructions");
+    }
+
+    /** The checks this version is locked on (references with their exact versions). */
+    public List<TypizerCheck> checks() {
+        return objects("checks", TypizerCheck::new);
     }
 
     /** {@code created_at}. */
